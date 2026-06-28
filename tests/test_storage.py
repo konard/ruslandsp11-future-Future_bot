@@ -19,6 +19,7 @@ def test_storage_keeps_ff_links_and_replaces_new_posts(tmp_path):
 
     assert storage.has_ff_posts() is True
     assert storage.get_ff_links() == {"https://vk.com/wall-2_2"}
+    assert storage.get_latest_ff_post_date() == 1
 
     storage.replace_new_posts(
         [

@@ -15,6 +15,10 @@ HASHTAG_RE = re.compile(r"(?<!\w)#([\wа-яА-ЯёЁ]+)", re.UNICODE)
 TRAILING_PUNCTUATION = ".,;:!?)]}\"'"
 LEADING_PUNCTUATION = "([{\"'"
 VK_HOSTS = {"vk.com", "vk.ru", "m.vk.com", "m.vk.ru", "www.vk.com", "www.vk.ru"}
+SEARCH_COMMAND_RE = re.compile(
+    r"^\s*/поиск\s+по\s*\((?P<keywords>[^)]*)\)\s+интервал\s+(?P<days>\d+)\s*д\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -54,6 +58,27 @@ class Post:
             links=links_from_vk_item(item),
             raw=item,
         )
+
+
+@dataclass(frozen=True)
+class SearchCommand:
+    keywords: tuple[str, ...]
+    hashtags: tuple[str, ...]
+    interval_days: int
+
+
+@dataclass(frozen=True)
+class IncomingMessage:
+    peer_id: int
+    from_id: int
+    text: str
+    date: int
+    message_id: int | None = None
+    conversation_message_id: int | None = None
+
+    @property
+    def sequence_id(self) -> int:
+        return self.conversation_message_id or self.message_id or self.date
 
 
 def post_url(owner_id: int, post_id: int) -> str:
@@ -120,6 +145,23 @@ def links_from_vk_item(item: Mapping[str, Any]) -> list[str]:
     return sorted({normalized for link in links if (normalized := normalize_url(link))})
 
 
+def parse_search_command(text: str) -> SearchCommand | None:
+    match = SEARCH_COMMAND_RE.search(text or "")
+    if not match:
+        return None
+
+    keywords = tuple(part.strip() for part in match.group("keywords").split(",") if part.strip())
+    if not keywords:
+        return None
+
+    interval_days = int(match.group("days"))
+    if interval_days <= 0:
+        return None
+
+    hashtags = tuple(f"#{keyword.lstrip('#')}" for keyword in keywords if keyword.lstrip("#"))
+    return SearchCommand(keywords=keywords, hashtags=hashtags, interval_days=interval_days)
+
+
 def filter_posts_by_terms(
     posts: Iterable[Post],
     keywords: Sequence[str],
@@ -165,9 +207,12 @@ def dedupe_posts(posts: Iterable[Post]) -> list[Post]:
     return unique
 
 
-def format_numbered_links(posts: Sequence[Post]) -> str:
+def format_numbered_links(
+    posts: Sequence[Post],
+    empty_message: str = "За последние сутки новых постов по заданным критериям не найдено.",
+) -> str:
     if not posts:
-        return "За последние сутки новых постов по заданным критериям не найдено."
+        return empty_message
     return "\n".join(f"{index}. {post.source_url}" for index, post in enumerate(posts, start=1))
 
 

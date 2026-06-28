@@ -5,7 +5,7 @@ on:
   push:
     branches:
       - main
-      - issue-1-14e5f42afb15
+      - "issue-*"
 
 jobs:
   pytest:

@@ -33,7 +33,7 @@ def run_forever(service: FutureBotService, settings: Settings) -> None:
     while True:
         delay = seconds_until_next_run(settings.schedule_time, settings.timezone)
         LOGGER.info(
-            "Next sync is scheduled in %.0f seconds at %s %s",
+            "Следующая синхронизация запланирована через %.0f с, в %s %s",
             delay,
             settings.schedule_time.strftime("%H:%M"),
             settings.timezone,
@@ -42,4 +42,16 @@ def run_forever(service: FutureBotService, settings: Settings) -> None:
         try:
             service.run_once()
         except Exception:
-            LOGGER.exception("Scheduled sync failed")
+            LOGGER.exception("Ошибка плановой синхронизации")
+
+
+def poll_chat_forever(service: FutureBotService, settings: Settings) -> None:
+    while True:
+        try:
+            handled_count = service.poll_chat_once()
+            if handled_count:
+                LOGGER.info("Обработано команд поиска: %s", handled_count)
+        except Exception:
+            LOGGER.exception("Ошибка проверки команд в чате")
+
+        time_module.sleep(settings.command_poll_interval_seconds)

@@ -65,6 +65,11 @@ class Storage:
             row = connection.execute(f"SELECT COUNT(*) FROM {FF_POSTS_TABLE}").fetchone()
         return bool(row[0])
 
+    def get_latest_ff_post_date(self) -> int | None:
+        with self._connect() as connection:
+            row = connection.execute(f"SELECT MAX(date) FROM {FF_POSTS_TABLE}").fetchone()
+        return None if row[0] is None else int(row[0])
+
     def upsert_ff_posts(self, posts: Iterable[Post]) -> int:
         post_list = list(posts)
         with self._connect() as connection:

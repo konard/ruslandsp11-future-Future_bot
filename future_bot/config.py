@@ -21,7 +21,10 @@ class Settings:
     source_groups: tuple[str, ...] = ("eofru", "asimovonline")
     keywords: tuple[str, ...] = ("Технология",)
     hashtags: tuple[str, ...] = ("#Технология",)
-    target_peer_id: int = 2_000_000_170
+    target_peer_id: int = 2_000_000_015
+    target_chat_title: str = "Аналитика и прогнозы"
+    allowed_user_ids: tuple[int, ...] = (199592366, 1849091)
+    command_poll_interval_seconds: float = 3.0
     schedule_time: time = time(3, 0)
     timezone: str = "Europe/Moscow"
     vk_api_version: str = "5.199"
@@ -33,7 +36,7 @@ class Settings:
 
         group_token = env.get("VK_GROUP_TOKEN", "").strip()
         user_token = env.get("VK_USER_TOKEN", "").strip()
-        message_token = env.get("VK_MESSAGE_TOKEN", "").strip() or user_token or group_token
+        message_token = env.get("VK_MESSAGE_TOKEN", "").strip() or group_token
         missing = [
             name
             for name, value in (
@@ -43,7 +46,7 @@ class Settings:
             if not value
         ]
         if missing:
-            raise ConfigError(f"Missing required environment variables: {', '.join(missing)}")
+            raise ConfigError(f"Не заданы обязательные переменные окружения: {', '.join(missing)}")
 
         return cls(
             vk_group_token=group_token,
@@ -61,7 +64,10 @@ class Settings:
             ),
             keywords=tuple(split_csv(env.get("FFBOT_KEYWORDS", "Технология"))),
             hashtags=tuple(split_csv(env.get("FFBOT_HASHTAGS", "#Технология"))),
-            target_peer_id=int(env.get("FFBOT_TARGET_PEER_ID", "2000000170")),
+            target_peer_id=int(env.get("FFBOT_TARGET_PEER_ID", "2000000015")),
+            target_chat_title=env.get("FFBOT_TARGET_CHAT_TITLE", "Аналитика и прогнозы"),
+            allowed_user_ids=parse_int_csv(env.get("FFBOT_ALLOWED_USER_IDS", "199592366,1849091")),
+            command_poll_interval_seconds=float(env.get("FFBOT_COMMAND_POLL_INTERVAL_SECONDS", "3")),
             schedule_time=parse_hhmm(env.get("FFBOT_SCHEDULE_TIME", "03:00")),
             timezone=env.get("FFBOT_TIMEZONE", "Europe/Moscow"),
             vk_api_version=env.get("VK_API_VERSION", "5.199"),
@@ -89,6 +95,13 @@ def split_csv(value: str) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
+def parse_int_csv(value: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(part) for part in split_csv(value))
+    except ValueError as exc:
+        raise ConfigError(f"Некорректный список числовых идентификаторов: {value!r}") from exc
+
+
 def normalize_group_identifier(value: str) -> str:
     raw = value.strip().strip("\"'").removeprefix("@")
     parsed = urlparse(raw)
@@ -98,7 +111,7 @@ def normalize_group_identifier(value: str) -> str:
         raw = raw.rstrip("/").rsplit("/", 1)[-1]
 
     if not raw:
-        raise ConfigError("VK group identifier cannot be empty")
+        raise ConfigError("Идентификатор группы VK не может быть пустым")
     return raw
 
 
@@ -107,4 +120,4 @@ def parse_hhmm(value: str) -> time:
         hour_text, minute_text = value.split(":", 1)
         return time(int(hour_text), int(minute_text))
     except ValueError as exc:
-        raise ConfigError(f"Invalid FFBOT_SCHEDULE_TIME value: {value!r}. Use HH:MM.") from exc
+        raise ConfigError(f"Некорректное значение FFBOT_SCHEDULE_TIME: {value!r}. Используйте HH:MM.") from exc

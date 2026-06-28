@@ -2,7 +2,7 @@ from datetime import time
 
 import pytest
 
-from future_bot.config import ConfigError, Settings, normalize_group_identifier, parse_hhmm
+from future_bot.config import ConfigError, Settings, normalize_group_identifier, parse_hhmm, parse_int_csv
 
 
 def test_normalize_group_identifier_accepts_vk_urls_and_plain_slugs():
@@ -17,6 +17,13 @@ def test_parse_hhmm():
         parse_hhmm("3am")
 
 
+def test_parse_int_csv():
+    assert parse_int_csv("199592366, 1849091") == (199592366, 1849091)
+
+    with pytest.raises(ConfigError):
+        parse_int_csv("199592366, abc")
+
+
 def test_settings_from_env_file(tmp_path, monkeypatch):
     monkeypatch.delenv("VK_GROUP_TOKEN", raising=False)
     monkeypatch.delenv("VK_USER_TOKEN", raising=False)
@@ -27,6 +34,7 @@ def test_settings_from_env_file(tmp_path, monkeypatch):
                 "VK_GROUP_TOKEN=group",
                 "VK_USER_TOKEN=user",
                 "FFBOT_SOURCE_GROUPS=https://vk.ru/eofru,@asimovonline",
+                "FFBOT_ALLOWED_USER_IDS=199592366,1849091",
                 "FFBOT_SCHEDULE_TIME=03:00",
                 "FFBOT_TIMEZONE=UTC",
             ]
@@ -38,7 +46,11 @@ def test_settings_from_env_file(tmp_path, monkeypatch):
 
     assert settings.vk_group_token == "group"
     assert settings.vk_user_token == "user"
-    assert settings.vk_message_token == "user"
+    assert settings.vk_message_token == "group"
     assert settings.source_groups == ("eofru", "asimovonline")
+    assert settings.target_peer_id == 2_000_000_015
+    assert settings.target_chat_title == "Аналитика и прогнозы"
+    assert settings.allowed_user_ids == (199592366, 1849091)
+    assert settings.command_poll_interval_seconds == 3.0
     assert settings.schedule_time == time(3, 0)
     assert settings.timezone == "UTC"
