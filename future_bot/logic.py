@@ -68,6 +68,11 @@ class SearchCommand:
 
 
 @dataclass(frozen=True)
+class ControlCommand:
+    action: str
+
+
+@dataclass(frozen=True)
 class IncomingMessage:
     peer_id: int
     from_id: int
@@ -157,6 +162,15 @@ def parse_search_command(text: str) -> SearchCommand | None:
 
     hashtags = tuple(f"#{keyword.lstrip('#')}" for keyword in keywords if keyword.lstrip("#"))
     return SearchCommand(keywords=keywords, hashtags=hashtags, interval_days=interval_days)
+
+
+def parse_control_command(text: str) -> ControlCommand | None:
+    normalized = " ".join((text or "").strip().casefold().split())
+    if normalized in {"/стоп программа", "/стоп программу", "/стоп бот", "/выход", "/shutdown"}:
+        return ControlCommand(action="shutdown")
+    if normalized in {"/стоп", "/стоп поиск", "/stop", "/stop search"}:
+        return ControlCommand(action="stop_search")
+    return None
 
 
 def filter_posts_by_terms(
