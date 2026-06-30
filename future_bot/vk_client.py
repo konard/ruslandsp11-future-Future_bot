@@ -109,6 +109,16 @@ class VKClient:
             },
         )
 
+    def edit_message(self, peer_id: int, message_id: int, message: str) -> Any:
+        return self.request(
+            "messages.edit",
+            {
+                "peer_id": peer_id,
+                "message_id": message_id,
+                "message": message,
+            },
+        )
+
     def get_conversations(self, count: int = 200) -> list[Mapping[str, Any]]:
         response = self.request("messages.getConversations", {"count": count})
         items = response.get("items", []) if isinstance(response, Mapping) else []

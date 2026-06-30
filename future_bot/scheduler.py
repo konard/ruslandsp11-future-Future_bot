@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time as time_module
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -31,7 +30,7 @@ def seconds_until_next_run(
 
 
 def run_forever(service: FutureBotService, settings: Settings) -> None:
-    while True:
+    while not service.shutdown_requested:
         delay = seconds_until_next_run(settings.schedule_time, settings.timezone)
         LOGGER.info(
             "Следующая синхронизация запланирована через %.0f с, в %s %s",
@@ -39,7 +38,8 @@ def run_forever(service: FutureBotService, settings: Settings) -> None:
             settings.schedule_time.strftime("%H:%M"),
             settings.timezone,
         )
-        time_module.sleep(delay)
+        if service.wait_for_shutdown(delay):
+            break
         try:
             service.run_once()
         except Exception:
@@ -47,7 +47,7 @@ def run_forever(service: FutureBotService, settings: Settings) -> None:
 
 
 def poll_chat_forever(service: FutureBotService, settings: Settings) -> None:
-    while True:
+    while not service.shutdown_requested:
         try:
             handled_count = service.poll_chat_once()
             if handled_count:
@@ -55,7 +55,7 @@ def poll_chat_forever(service: FutureBotService, settings: Settings) -> None:
         except Exception:
             LOGGER.exception("Ошибка проверки команд в чате")
 
-        time_module.sleep(settings.command_poll_interval_seconds)
+        service.wait_for_shutdown(settings.command_poll_interval_seconds)
 
 
 def run_forever_with_chat_polling(service: FutureBotService, settings: Settings) -> None:

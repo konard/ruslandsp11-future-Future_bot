@@ -3,6 +3,7 @@ from future_bot.logic import (
     extract_links,
     filter_posts_by_terms,
     format_numbered_links,
+    parse_control_command,
     parse_search_command,
     remove_posts_linked_from_ff,
 )
@@ -95,3 +96,13 @@ def test_parse_search_command_allows_empty_terms_for_file_based_search():
     assert command.keywords == ()
     assert command.hashtags == ()
     assert command.interval_days == 5
+
+
+def test_parse_control_commands_for_stop_search_and_shutdown():
+    stop_search = parse_control_command("/стоп поиск")
+    shutdown = parse_control_command("/стоп программа")
+
+    assert stop_search is not None
+    assert stop_search.action == "stop_search"
+    assert shutdown is not None
+    assert shutdown.action == "shutdown"
