@@ -14,7 +14,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-file", default=".env", help="Путь к файлу окружения.")
     parser.add_argument("--once", action="store_true", help="Выполнить один цикл поиска и выйти.")
     parser.add_argument("--daemon", action="store_true", help="Запускать поиск каждый день в FFBOT_SCHEDULE_TIME.")
-    parser.add_argument("--poll-chat", action="store_true", help="Проверять чат на команды раз в 3 секунды.")
+    parser.add_argument("--poll-chat", action="store_true", help="Проверять чат на команды раз в 10 секунд.")
     return parser
 
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Protocol
@@ -24,6 +24,8 @@ from future_bot.storage import Storage
 
 LOGGER = logging.getLogger(__name__)
 MAX_VK_MESSAGE_LENGTH = 4000
+SOURCE_GROUP_CACHE_TTL = timedelta(hours=12)
+PROGRESS_UPDATE_INTERVAL = timedelta(minutes=1)
 
 
 class WallClient(Protocol):
@@ -37,9 +39,6 @@ class MessageClient(Protocol):
 
 
 class ChatClient(Protocol):
-    def find_conversation_peer_id(self, title: str) -> int | None:
-        ...
-
     def iter_recent_messages(self, peer_id: int, count: int = 50) -> Iterable[IncomingMessage]:
         ...
 
@@ -64,6 +63,15 @@ class ControlResult:
     message: str
 
 
+@dataclass(frozen=True)
+class _SourcePostsCache:
+    source_groups: tuple[str, ...]
+    since_timestamp: int
+    fetched_at: datetime
+    posts: tuple[Post, ...]
+    failed_groups: tuple[str, ...]
+
+
 class FutureBotService:
     def __init__(
         self,
@@ -72,15 +80,18 @@ class FutureBotService:
         message_client: MessageClient,
         storage: Storage,
         chat_client: ChatClient | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.settings = settings
         self.wall_client = wall_client
         self.message_client = message_client
         self.storage = storage
         self.chat_client = chat_client
+        self._clock = clock
         self._run_lock = threading.Lock()
         self._search_stop_event = threading.Event()
         self._shutdown_event = threading.Event()
+        self._source_posts_cache: _SourcePostsCache | None = None
 
     @property
     def search_stop_requested(self) -> bool:
@@ -99,6 +110,11 @@ class FutureBotService:
     def wait_for_shutdown(self, timeout: float | None = None) -> bool:
         return self._shutdown_event.wait(timeout)
 
+    def _now(self) -> datetime:
+        if self._clock is not None:
+            return self._clock()
+        return datetime.now(ZoneInfo(self.settings.timezone))
+
     def run_once(
         self,
         now: datetime | None = None,
@@ -108,6 +124,7 @@ class FutureBotService:
         peer_id: int | None = None,
         include_summary: bool = False,
         show_progress: bool = False,
+        use_source_cache: bool = False,
     ) -> SyncResult:
         with self._run_lock:
             self._search_stop_event.clear()
@@ -120,6 +137,7 @@ class FutureBotService:
                     peer_id=peer_id,
                     include_summary=include_summary,
                     show_progress=show_progress,
+                    use_source_cache=use_source_cache,
                 )
             finally:
                 self._search_stop_event.clear()
@@ -133,128 +151,174 @@ class FutureBotService:
         peer_id: int | None = None,
         include_summary: bool = False,
         show_progress: bool = False,
+        use_source_cache: bool = False,
     ) -> SyncResult:
         if interval_days <= 0:
             raise ValueError("Интервал поиска должен быть больше нуля")
 
-        current_time = now or datetime.now(ZoneInfo(self.settings.timezone))
+        current_time = now or self._now()
         target_peer_id = peer_id or self.settings.target_peer_id
         source_since_timestamp = int((current_time - timedelta(days=interval_days)).timestamp())
         source_groups = load_source_groups_file(self.settings.source_groups_file)
+        progress_started_at = current_time
         progress = (
             _ProgressMessage.start(
                 self.message_client,
                 target_peer_id,
-                _format_progress_message(checked_groups=0, total_groups=len(source_groups)),
+                _format_progress_message(
+                    checked_groups=0,
+                    total_groups=len(source_groups),
+                    started_at=progress_started_at,
+                    current_time=progress_started_at,
+                ),
+                current_time=progress_started_at,
             )
             if show_progress
             else None
         )
 
-        effective_keywords = tuple(keywords or ())
-        effective_hashtags = tuple(hashtags or ())
-        if effective_keywords and hashtags is None:
-            effective_hashtags = tuple(
-                f"#{keyword.lstrip('#')}" for keyword in effective_keywords if keyword.lstrip("#")
+        try:
+            effective_keywords = tuple(keywords or ())
+            effective_hashtags = tuple(hashtags or ())
+            if effective_keywords and hashtags is None:
+                effective_hashtags = tuple(
+                    f"#{keyword.lstrip('#')}" for keyword in effective_keywords if keyword.lstrip("#")
+                )
+            if not effective_keywords and not effective_hashtags:
+                terms = load_terms_file(self.settings.terms_file)
+                effective_keywords = terms.keywords
+                effective_hashtags = terms.hashtags
+
+            ff_full_import = not self.storage.has_ff_posts()
+            ff_since = None if ff_full_import else self.storage.get_latest_ff_post_date()
+            failed_groups: list[str] = []
+            ff_posts = self._collect_wall_posts(self.settings.ff_group, ff_since, failed_groups)
+            self.storage.upsert_ff_posts(ff_posts)
+            LOGGER.info("Сохранено постов Формулы Футурологии: %s", len(ff_posts))
+
+            source_posts: list[Post] = []
+            checked_groups = 0
+            source_failure_start = len(failed_groups)
+            cache = (
+                self._get_source_posts_cache(
+                    source_groups=source_groups,
+                    since_timestamp=source_since_timestamp,
+                    current_time=current_time,
+                )
+                if use_source_cache
+                else None
             )
-        if not effective_keywords and not effective_hashtags:
-            terms = load_terms_file(self.settings.terms_file)
-            effective_keywords = terms.keywords
-            effective_hashtags = terms.hashtags
-
-        ff_full_import = not self.storage.has_ff_posts()
-        ff_since = None if ff_full_import else self.storage.get_latest_ff_post_date()
-        failed_groups: list[str] = []
-        ff_posts = self._collect_wall_posts(self.settings.ff_group, ff_since, failed_groups)
-        self.storage.upsert_ff_posts(ff_posts)
-        LOGGER.info("Сохранено постов Формулы Футурологии: %s", len(ff_posts))
-
-        source_posts: list[Post] = []
-        checked_groups = 0
-        for group in source_groups:
-            if self.search_stop_requested:
-                return self._finish_stopped_search(
-                    progress=progress,
-                    peer_id=target_peer_id,
-                    ff_full_import=ff_full_import,
-                    ff_posts_seen=len(ff_posts),
-                    source_posts_seen=len(dedupe_posts(source_posts)),
-                    keywords=effective_keywords,
-                    interval_days=interval_days,
-                    checked_groups=checked_groups,
-                    total_groups=len(source_groups),
-                    failed_groups=failed_groups,
+            if cache is not None:
+                source_posts = [post for post in cache.posts if post.date >= source_since_timestamp]
+                failed_groups.extend(cache.failed_groups)
+                checked_groups = len(source_groups)
+                LOGGER.info(
+                    "Используется кеш опроса %s групп от %s",
+                    len(source_groups),
+                    cache.fetched_at.isoformat(),
                 )
+            else:
+                for group in source_groups:
+                    if self.search_stop_requested:
+                        return self._finish_stopped_search(
+                            progress=progress,
+                            peer_id=target_peer_id,
+                            ff_full_import=ff_full_import,
+                            ff_posts_seen=len(ff_posts),
+                            source_posts_seen=len(dedupe_posts(source_posts)),
+                            keywords=effective_keywords,
+                            interval_days=interval_days,
+                            checked_groups=checked_groups,
+                            total_groups=len(source_groups),
+                            failed_groups=failed_groups,
+                        )
 
-            group_posts = self._collect_wall_posts(group, source_since_timestamp, failed_groups)
-            LOGGER.info("Получено постов из %s: %s", group, len(group_posts))
-            source_posts.extend(group_posts)
-            checked_groups += 1
-            if progress is not None:
-                progress.update(
-                    _format_progress_message(
-                        checked_groups=checked_groups,
-                        total_groups=len(source_groups),
-                        failed_groups=len(failed_groups),
+                    group_posts = self._collect_wall_posts(group, source_since_timestamp, failed_groups)
+                    LOGGER.info("Получено постов из %s: %s", group, len(group_posts))
+                    source_posts.extend(group_posts)
+                    checked_groups += 1
+                    if progress is not None:
+                        progress_time = self._now()
+                        progress.update(
+                            _format_progress_message(
+                                checked_groups=checked_groups,
+                                total_groups=len(source_groups),
+                                failed_groups=len(failed_groups),
+                                started_at=progress_started_at,
+                                current_time=progress_time,
+                            ),
+                            current_time=progress_time,
+                        )
+
+                    if self.search_stop_requested:
+                        return self._finish_stopped_search(
+                            progress=progress,
+                            peer_id=target_peer_id,
+                            ff_full_import=ff_full_import,
+                            ff_posts_seen=len(ff_posts),
+                            source_posts_seen=len(dedupe_posts(source_posts)),
+                            keywords=effective_keywords,
+                            interval_days=interval_days,
+                            checked_groups=checked_groups,
+                            total_groups=len(source_groups),
+                            failed_groups=failed_groups,
+                        )
+
+                if use_source_cache:
+                    self._source_posts_cache = _SourcePostsCache(
+                        source_groups=source_groups,
+                        since_timestamp=source_since_timestamp,
+                        fetched_at=current_time,
+                        posts=tuple(source_posts),
+                        failed_groups=tuple(failed_groups[source_failure_start:]),
                     )
-                )
 
-            if self.search_stop_requested:
-                return self._finish_stopped_search(
-                    progress=progress,
-                    peer_id=target_peer_id,
-                    ff_full_import=ff_full_import,
-                    ff_posts_seen=len(ff_posts),
-                    source_posts_seen=len(dedupe_posts(source_posts)),
-                    keywords=effective_keywords,
+            unique_source_posts = dedupe_posts(source_posts)
+            filtered_posts = filter_posts_by_terms(
+                unique_source_posts,
+                keywords=effective_keywords,
+                hashtags=effective_hashtags,
+            )
+            final_posts = remove_posts_linked_from_ff(filtered_posts, self.storage.get_ff_links())
+            final_posts = sorted(final_posts, key=lambda post: post.date, reverse=True)
+            self.storage.replace_new_posts(final_posts)
+
+            links_message = format_numbered_links(
+                final_posts,
+                empty_message=f"За последние {interval_days} д. новых постов по заданным критериям не найдено.",
+            )
+            if include_summary:
+                message = _format_sync_report(
+                    keywords=effective_keywords or effective_hashtags,
                     interval_days=interval_days,
-                    checked_groups=checked_groups,
-                    total_groups=len(source_groups),
+                    ff_posts_seen=len(ff_posts),
+                    source_posts_seen=len(unique_source_posts),
+                    filtered_posts=len(filtered_posts),
+                    final_posts=len(final_posts),
                     failed_groups=failed_groups,
                 )
+                message = f"{message}\n\n{links_message}"
+            else:
+                message = links_message
 
-        unique_source_posts = dedupe_posts(source_posts)
-        filtered_posts = filter_posts_by_terms(
-            unique_source_posts,
-            keywords=effective_keywords,
-            hashtags=effective_hashtags,
-        )
-        final_posts = remove_posts_linked_from_ff(filtered_posts, self.storage.get_ff_links())
-        final_posts = sorted(final_posts, key=lambda post: post.date, reverse=True)
-        self.storage.replace_new_posts(final_posts)
+            _finish_message(self.message_client, target_peer_id, message, progress)
+            self.storage.set_metadata("last_successful_sync_at", current_time.isoformat())
 
-        links_message = format_numbered_links(
-            final_posts,
-            empty_message=f"За последние {interval_days} д. новых постов по заданным критериям не найдено.",
-        )
-        if include_summary:
-            message = _format_sync_report(
-                keywords=effective_keywords or effective_hashtags,
-                interval_days=interval_days,
+            return SyncResult(
+                ff_full_import=ff_full_import,
                 ff_posts_seen=len(ff_posts),
                 source_posts_seen=len(unique_source_posts),
                 filtered_posts=len(filtered_posts),
                 final_posts=len(final_posts),
-                failed_groups=failed_groups,
+                message=message,
+                keywords=effective_keywords,
+                interval_days=interval_days,
+                failed_groups=tuple(failed_groups),
             )
-            message = f"{message}\n\n{links_message}"
-        else:
-            message = links_message
-
-        _finish_message(self.message_client, target_peer_id, message, progress)
-        self.storage.set_metadata("last_successful_sync_at", current_time.isoformat())
-
-        return SyncResult(
-            ff_full_import=ff_full_import,
-            ff_posts_seen=len(ff_posts),
-            source_posts_seen=len(unique_source_posts),
-            filtered_posts=len(filtered_posts),
-            final_posts=len(final_posts),
-            message=message,
-            keywords=effective_keywords,
-            interval_days=interval_days,
-            failed_groups=tuple(failed_groups),
-        )
+        except Exception as exc:
+            if progress is not None:
+                self._finish_unexpected_progress_error(progress, exc)
+            raise
 
     def handle_chat_message(
         self,
@@ -295,13 +359,14 @@ class FutureBotService:
             peer_id=message.peer_id,
             include_summary=True,
             show_progress=True,
+            use_source_cache=True,
         )
 
     def poll_chat_once(self, now: datetime | None = None) -> int:
         if self.chat_client is None:
             raise RuntimeError("Для проверки команд нужен клиент чата")
 
-        peer_id = self.resolve_target_peer_id()
+        peer_id = self.settings.target_peer_id
         metadata_key = f"last_processed_message_sequence:{peer_id}"
         last_processed_value = self.storage.get_metadata(metadata_key)
         messages = sorted(
@@ -329,20 +394,29 @@ class FutureBotService:
 
         return handled_count
 
-    def resolve_target_peer_id(self) -> int:
-        if self.chat_client is None:
-            return self.settings.target_peer_id
+    def _get_source_posts_cache(
+        self,
+        source_groups: tuple[str, ...],
+        since_timestamp: int,
+        current_time: datetime,
+    ) -> _SourcePostsCache | None:
+        cache = self._source_posts_cache
+        if cache is None:
+            return None
+        if cache.source_groups != source_groups:
+            return None
+        if current_time - cache.fetched_at >= SOURCE_GROUP_CACHE_TTL:
+            return None
+        if cache.since_timestamp > since_timestamp:
+            return None
+        return cache
 
-        peer_id = self.chat_client.find_conversation_peer_id(self.settings.target_chat_title)
-        if peer_id is None:
-            LOGGER.info(
-                "Чат %r не найден через messages.getConversations, используется peer_id %s",
-                self.settings.target_chat_title,
-                self.settings.target_peer_id,
-            )
-            return self.settings.target_peer_id
-
-        return peer_id
+    def _finish_unexpected_progress_error(self, progress: "_ProgressMessage", exc: Exception) -> None:
+        message = _format_unexpected_error_message(exc)
+        try:
+            progress.finish(message)
+        except Exception:
+            LOGGER.exception("Не удалось обновить статус после непредвиденной ошибки поиска")
 
     def _collect_wall_posts(
         self,
@@ -430,15 +504,43 @@ def _format_progress_message(
     checked_groups: int,
     total_groups: int,
     failed_groups: int = 0,
+    started_at: datetime | None = None,
+    current_time: datetime | None = None,
 ) -> str:
     percent = 100 if total_groups == 0 else int(checked_groups / total_groups * 100)
     lines = [
         "Поиск выполняется.",
         f"Проверено групп: {checked_groups} из {total_groups} ({percent}%).",
+        f"Примерное окончание: {_format_estimated_finish(checked_groups, total_groups, started_at, current_time)}.",
     ]
     if failed_groups:
         lines.append(f"Групп с ошибками: {failed_groups}.")
     return "\n".join(lines)
+
+
+def _format_estimated_finish(
+    checked_groups: int,
+    total_groups: int,
+    started_at: datetime | None,
+    current_time: datetime | None,
+) -> str:
+    if current_time is None:
+        return "рассчитывается"
+    if total_groups == 0:
+        return current_time.strftime("%H:%M")
+    if checked_groups <= 0 or started_at is None:
+        return "рассчитывается"
+
+    elapsed_seconds = max((current_time - started_at).total_seconds(), 1.0)
+    seconds_per_group = elapsed_seconds / checked_groups
+    remaining_seconds = max(total_groups - checked_groups, 0) * seconds_per_group
+    estimated_finish = current_time + timedelta(seconds=remaining_seconds)
+    return estimated_finish.strftime("%H:%M")
+
+
+def _format_unexpected_error_message(exc: Exception) -> str:
+    details = f"{exc.__class__.__name__}: {exc}"
+    return f"Непредвиденная ошибка.\n{details[-300:]}"
 
 
 def split_message(message: str, max_length: int | None = None) -> list[str]:
@@ -498,21 +600,38 @@ def _extract_message_id(response: object) -> int | None:
 
 
 class _ProgressMessage:
-    def __init__(self, message_client: MessageClient, peer_id: int, message_id: int | None) -> None:
+    def __init__(
+        self,
+        message_client: MessageClient,
+        peer_id: int,
+        message_id: int | None,
+        last_update_at: datetime,
+    ) -> None:
         self.message_client = message_client
         self.peer_id = peer_id
         self.message_id = message_id
+        self.last_update_at = last_update_at
 
     @classmethod
-    def start(cls, message_client: MessageClient, peer_id: int, message: str) -> "_ProgressMessage":
+    def start(
+        cls,
+        message_client: MessageClient,
+        peer_id: int,
+        message: str,
+        current_time: datetime,
+    ) -> "_ProgressMessage":
         response = message_client.send_message(peer_id, message)
-        return cls(message_client, peer_id, _extract_message_id(response))
+        return cls(message_client, peer_id, _extract_message_id(response), current_time)
 
-    def update(self, message: str) -> None:
+    def update(self, message: str, current_time: datetime, force: bool = False) -> bool:
         edit_message = getattr(self.message_client, "edit_message", None)
         if self.message_id is None or edit_message is None:
-            return
+            return False
+        if not force and current_time - self.last_update_at < PROGRESS_UPDATE_INTERVAL:
+            return False
         edit_message(self.peer_id, self.message_id, message)
+        self.last_update_at = current_time
+        return True
 
     def finish(self, message: str) -> None:
         chunks = split_message(message)

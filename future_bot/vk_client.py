@@ -13,10 +13,23 @@ from urllib.request import Request, build_opener
 from future_bot.logic import IncomingMessage, Post
 
 LOGGER = logging.getLogger(__name__)
+VK_FLOOD_CONTROL_ERROR_CODE = 9
+VK_FLOOD_CONTROL_SLEEP_SECONDS = 5 * 60
 
 
 class VKAPIError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        method: str | None = None,
+        error_code: int | None = None,
+        error_msg: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.method = method
+        self.error_code = error_code
+        self.error_msg = error_msg
 
 
 class VKClient:
@@ -26,13 +39,32 @@ class VKClient:
         api_version: str = "5.199",
         api_url: str = "https://api.vk.com/method",
         session: Any | None = None,
+        sleeper: Any | None = None,
+        flood_control_sleep_seconds: int = VK_FLOOD_CONTROL_SLEEP_SECONDS,
     ) -> None:
         self.token = token
         self.api_version = api_version
         self.api_url = api_url.rstrip("/")
         self.session = session or build_opener()
+        self.sleeper = sleeper or time.sleep
+        self.flood_control_sleep_seconds = flood_control_sleep_seconds
 
     def request(self, method: str, params: Mapping[str, Any] | None = None) -> Any:
+        try:
+            return self._request_once(method, params)
+        except VKAPIError as exc:
+            if exc.error_code != VK_FLOOD_CONTROL_ERROR_CODE:
+                raise
+
+            LOGGER.warning(
+                "VK API %s вернул Flood control, пауза на %s секунд",
+                method,
+                self.flood_control_sleep_seconds,
+            )
+            self.sleeper(self.flood_control_sleep_seconds)
+            return self._request_once(method, params)
+
+    def _request_once(self, method: str, params: Mapping[str, Any] | None = None) -> Any:
         payload = dict(params or {})
         payload["access_token"] = self.token
         payload["v"] = self.api_version
@@ -46,20 +78,25 @@ class VKClient:
             with self.session.open(request, timeout=30) as response:
                 data = response.read()
         except HTTPError as exc:
-            raise VKAPIError(f"HTTP-ошибка VK API {method}: {exc.code}") from exc
+            raise VKAPIError(f"HTTP-ошибка VK API {method}: {exc.code}", method=method) from exc
         except URLError as exc:
-            raise VKAPIError(f"Сетевая ошибка VK API {method}: {exc.reason}") from exc
+            raise VKAPIError(f"Сетевая ошибка VK API {method}: {exc.reason}", method=method) from exc
 
         try:
             decoded = json.loads(data.decode("utf-8"))
         except (UnicodeDecodeError, JSONDecodeError) as exc:
-            raise VKAPIError(f"VK API {method} вернул некорректный JSON") from exc
+            raise VKAPIError(f"VK API {method} вернул некорректный JSON", method=method) from exc
 
         data = decoded
         if "error" in data:
             error = data["error"]
+            error_code = _error_code(error)
+            error_msg = str(error.get("error_msg") or "") if isinstance(error, Mapping) else ""
             raise VKAPIError(
-                f"Ошибка VK API {method}: {error.get('error_code')} {error.get('error_msg')}"
+                f"Ошибка VK API {method}: {error_code} {error_msg}",
+                method=method,
+                error_code=error_code,
+                error_msg=error_msg,
             )
         return data.get("response")
 
@@ -119,31 +156,6 @@ class VKClient:
             },
         )
 
-    def get_conversations(self, count: int = 200) -> list[Mapping[str, Any]]:
-        response = self.request("messages.getConversations", {"count": count})
-        items = response.get("items", []) if isinstance(response, Mapping) else []
-        return [item for item in items if isinstance(item, Mapping)]
-
-    def find_conversation_peer_id(self, title: str) -> int | None:
-        normalized_title = title.casefold()
-        for item in self.get_conversations():
-            conversation = item.get("conversation")
-            if not isinstance(conversation, Mapping):
-                continue
-
-            chat_settings = conversation.get("chat_settings")
-            if not isinstance(chat_settings, Mapping):
-                continue
-
-            if str(chat_settings.get("title") or "").casefold() != normalized_title:
-                continue
-
-            peer = conversation.get("peer")
-            if isinstance(peer, Mapping) and peer.get("id") is not None:
-                return int(peer["id"])
-
-        return None
-
     def iter_recent_messages(self, peer_id: int, count: int = 50) -> Iterable[IncomingMessage]:
         response = self.request("messages.getHistory", {"peer_id": peer_id, "count": count})
         items = response.get("items", []) if isinstance(response, Mapping) else []
@@ -162,3 +174,12 @@ class VKClient:
 
 def _optional_int(value: Any) -> int | None:
     return None if value is None else int(value)
+
+
+def _error_code(error: Any) -> int | None:
+    if not isinstance(error, Mapping):
+        return None
+    try:
+        return _optional_int(error.get("error_code"))
+    except (TypeError, ValueError):
+        return None

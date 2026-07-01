@@ -78,6 +78,6 @@ def test_settings_from_env_file(tmp_path, monkeypatch):
     assert settings.target_peer_id == 2_000_000_015
     assert settings.target_chat_title == "Аналитика и прогнозы"
     assert settings.allowed_user_ids == (199592366, 1849091)
-    assert settings.command_poll_interval_seconds == 3.0
+    assert settings.command_poll_interval_seconds == 10.0
     assert settings.schedule_time == time(3, 0)
     assert settings.timezone == "UTC"

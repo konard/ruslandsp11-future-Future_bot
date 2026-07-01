@@ -32,7 +32,7 @@ class Settings:
     target_peer_id: int = 2_000_000_015
     target_chat_title: str = "Аналитика и прогнозы"
     allowed_user_ids: tuple[int, ...] = (199592366, 1849091)
-    command_poll_interval_seconds: float = 3.0
+    command_poll_interval_seconds: float = 10.0
     schedule_time: time = time(3, 0)
     timezone: str = "Europe/Moscow"
     vk_api_version: str = "5.199"
@@ -69,7 +69,7 @@ class Settings:
             target_peer_id=int(env.get("FFBOT_TARGET_PEER_ID", "2000000015")),
             target_chat_title=env.get("FFBOT_TARGET_CHAT_TITLE", "Аналитика и прогнозы"),
             allowed_user_ids=parse_int_csv(env.get("FFBOT_ALLOWED_USER_IDS", "199592366,1849091")),
-            command_poll_interval_seconds=float(env.get("FFBOT_COMMAND_POLL_INTERVAL_SECONDS", "3")),
+            command_poll_interval_seconds=float(env.get("FFBOT_COMMAND_POLL_INTERVAL_SECONDS", "10")),
             schedule_time=parse_hhmm(env.get("FFBOT_SCHEDULE_TIME", "03:00")),
             timezone=env.get("FFBOT_TIMEZONE", "Europe/Moscow"),
             vk_api_version=env.get("VK_API_VERSION", "5.199"),
