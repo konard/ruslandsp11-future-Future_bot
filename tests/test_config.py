@@ -5,12 +5,47 @@ import pytest
 from future_bot.config import (
     ConfigError,
     Settings,
+    load_command_lines,
     load_source_groups_file,
     load_terms_file,
     normalize_group_identifier,
     parse_hhmm,
     parse_int_csv,
+    parse_positive_int,
 )
+
+
+def test_load_command_lines_parses_each_line_as_separate_command(tmp_path):
+    terms_file = tmp_path / "Список слов и хэштегов.txt"
+    terms_file.write_text(
+        "ИИ+прогноз+технологии, антилопы+экология\n\n#роботы\n",
+        encoding="utf-8",
+    )
+
+    commands = load_command_lines(terms_file)
+
+    assert [command.groups for command in commands] == [
+        (("ИИ", "прогноз", "технологии"), ("антилопы", "экология")),
+        (("#роботы",),),
+    ]
+    assert commands[0].raw == "ИИ+прогноз+технологии, антилопы+экология"
+
+
+def test_load_command_lines_rejects_empty_file(tmp_path):
+    terms_file = tmp_path / "Список слов и хэштегов.txt"
+    terms_file.write_text("\n  \n", encoding="utf-8")
+
+    with pytest.raises(ConfigError):
+        load_command_lines(terms_file)
+
+
+def test_parse_positive_int_validates_value():
+    assert parse_positive_int("10", "FFBOT_POST_RETENTION_DAYS") == 10
+
+    with pytest.raises(ConfigError):
+        parse_positive_int("0", "FFBOT_POST_RETENTION_DAYS")
+    with pytest.raises(ConfigError):
+        parse_positive_int("abc", "FFBOT_POST_RETENTION_DAYS")
 
 
 def test_normalize_group_identifier_accepts_vk_urls_and_plain_slugs():
@@ -54,6 +89,7 @@ def test_settings_from_env_file(tmp_path, monkeypatch):
     monkeypatch.delenv("VK_USER_TOKEN", raising=False)
     monkeypatch.delenv("FFBOT_SOURCE_GROUPS_FILE", raising=False)
     monkeypatch.delenv("FFBOT_TERMS_FILE", raising=False)
+    monkeypatch.delenv("FFBOT_POST_RETENTION_DAYS", raising=False)
     env_file = tmp_path / ".env"
     env_file.write_text(
         "\n".join(
@@ -63,12 +99,14 @@ def test_settings_from_env_file(tmp_path, monkeypatch):
                 "FFBOT_ALLOWED_USER_IDS=199592366,1849091",
                 "FFBOT_SCHEDULE_TIME=03:00",
                 "FFBOT_TIMEZONE=UTC",
+                "FFBOT_POST_RETENTION_DAYS=15",
             ]
         ),
         encoding="utf-8",
     )
 
     settings = Settings.from_env(env_file)
+    assert settings.post_retention_days == 15
 
     assert settings.vk_group_token == "group"
     assert settings.vk_user_token == "user"

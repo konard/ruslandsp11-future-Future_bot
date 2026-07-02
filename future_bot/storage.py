@@ -83,6 +83,20 @@ class Storage:
             self._upsert_posts(connection, NEW_POSTS_TABLE, post_list)
         return len(post_list)
 
+    def delete_posts_older_than(self, cutoff_timestamp: int, table: str = FF_POSTS_TABLE) -> int:
+        """Удаляет из таблицы посты старше ``cutoff_timestamp`` (unix-время).
+
+        Используется для ограничения объема базы: посты старше N дней стираются,
+        оставляя только свежие записи.
+        """
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"DELETE FROM {table} WHERE date < ?",
+                (int(cutoff_timestamp),),
+            )
+            return cursor.rowcount if cursor.rowcount is not None else 0
+
     def get_ff_links(self) -> set[str]:
         links: set[str] = set()
         with self._connect() as connection:

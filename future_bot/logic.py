@@ -62,9 +62,24 @@ class Post:
 
 @dataclass(frozen=True)
 class SearchCommand:
-    keywords: tuple[str, ...]
-    hashtags: tuple[str, ...]
+    """Разобранная команда поиска.
+
+    ``groups`` описывает поисковый запрос как логическое ИЛИ групп: каждая
+    группа - это набор слов, соединенных логическим И (все слова должны
+    присутствовать в одном посте). Например ``(ИИ+прогноз, антилопы)``
+    превращается в ``((\"ИИ\", \"прогноз\"), (\"антилопы\",))``.
+    """
+
+    groups: tuple[tuple[str, ...], ...]
     interval_days: int
+
+    @property
+    def keywords(self) -> tuple[str, ...]:
+        return flatten_terms(self.groups)
+
+    @property
+    def hashtags(self) -> tuple[str, ...]:
+        return tuple(f"#{term.lstrip('#')}" for term in self.keywords if term.lstrip("#"))
 
 
 @dataclass(frozen=True)
@@ -150,27 +165,118 @@ def links_from_vk_item(item: Mapping[str, Any]) -> list[str]:
     return sorted({normalized for link in links if (normalized := normalize_url(link))})
 
 
+def parse_query_groups(text: str) -> tuple[tuple[str, ...], ...]:
+    """Разбирает выражение в скобках в группы слов.
+
+    Запятая означает логическое ИЛИ между группами, ``+`` - логическое И
+    внутри группы. Пустые слова и группы отбрасываются.
+    """
+
+    groups: list[tuple[str, ...]] = []
+    for part in (text or "").split(","):
+        terms = tuple(term.strip() for term in part.split("+") if term.strip())
+        if terms:
+            groups.append(terms)
+    return tuple(groups)
+
+
+def flatten_terms(groups: Sequence[Sequence[str]]) -> tuple[str, ...]:
+    """Возвращает уникальные слова из всех групп, сохраняя порядок."""
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for group in groups:
+        for term in group:
+            key = term.casefold()
+            if term and key not in seen:
+                seen.add(key)
+                result.append(term)
+    return tuple(result)
+
+
+def format_groups(groups: Sequence[Sequence[str]]) -> str:
+    """Человекочитаемое представление запроса, например ``ИИ+прогноз, антилопы``."""
+
+    return ", ".join("+".join(group) for group in groups if group)
+
+
 def parse_search_command(text: str) -> SearchCommand | None:
     match = SEARCH_COMMAND_RE.search(text or "")
     if not match:
         return None
 
-    keywords = tuple(part.strip() for part in match.group("keywords").split(",") if part.strip())
+    groups = parse_query_groups(match.group("keywords"))
     interval_days = int(match.group("days"))
     if interval_days <= 0:
         return None
 
-    hashtags = tuple(f"#{keyword.lstrip('#')}" for keyword in keywords if keyword.lstrip("#"))
-    return SearchCommand(keywords=keywords, hashtags=hashtags, interval_days=interval_days)
+    return SearchCommand(groups=groups, interval_days=interval_days)
 
 
 def parse_control_command(text: str) -> ControlCommand | None:
     normalized = " ".join((text or "").strip().casefold().split())
-    if normalized in {"/стоп программа", "/стоп программу", "/стоп бот", "/выход", "/shutdown"}:
+    normalized = normalized.rstrip(".,;:!?…").strip()
+    if normalized in {
+        "/стоп программа",
+        "/стоп программу",
+        "/стоп бот",
+        "/стоп программы",
+        "/выход",
+        "/shutdown",
+    }:
         return ControlCommand(action="shutdown")
-    if normalized in {"/стоп", "/стоп поиск", "/stop", "/stop search"}:
+    if normalized in {
+        "/стоп",
+        "/стоп поиск",
+        "/стоп поиска",
+        "/стоп поиски",
+        "/стоп-поиск",
+        "/stop",
+        "/stop search",
+    }:
         return ControlCommand(action="stop_search")
     return None
+
+
+def _compile_term(term: str) -> "re.Pattern[str]":
+    """Компилирует слово в шаблон, требующий обособленного совпадения.
+
+    Слово должно быть отдельным словом (или хэштегом), а не частью другого
+    слова: ``Маск`` не совпадет с ``маскировка``, а ``ИИ`` не совпадет внутри
+    другого слова. Границы определяются символами ``\\w`` в Unicode, поэтому
+    правило работает и для кириллицы.
+    """
+
+    body = re.escape(term.strip().lstrip("#"))
+    return re.compile(rf"(?<!\w){body}(?!\w)", re.IGNORECASE)
+
+
+def filter_posts_by_groups(
+    posts: Iterable[Post],
+    groups: Sequence[Sequence[str]],
+) -> list[Post]:
+    """Отбирает посты по запросу вида ИЛИ(групп) из И(слов).
+
+    Пост проходит фильтр, если хотя бы одна группа совпала полностью, то есть
+    все слова группы присутствуют в тексте поста как обособленные слова.
+    """
+
+    compiled_groups: list[list[re.Pattern[str]]] = []
+    for group in groups:
+        patterns = [_compile_term(term) for term in group if term.strip()]
+        if patterns:
+            compiled_groups.append(patterns)
+
+    if not compiled_groups:
+        return []
+
+    filtered: list[Post] = []
+    for post in posts:
+        text = post.text
+        if any(all(pattern.search(text) for pattern in group) for group in compiled_groups):
+            filtered.append(post)
+
+    return filtered
 
 
 def filter_posts_by_terms(
@@ -178,19 +284,11 @@ def filter_posts_by_terms(
     keywords: Sequence[str],
     hashtags: Sequence[str],
 ) -> list[Post]:
-    normalized_keywords = tuple(keyword.casefold() for keyword in keywords if keyword.strip())
-    normalized_hashtags = tuple(_normalize_hashtag(hashtag) for hashtag in hashtags if hashtag.strip())
+    """Совместимая обертка: каждое слово и хэштег - отдельная группа (ИЛИ)."""
 
-    filtered: list[Post] = []
-    for post in posts:
-        text = post.text.casefold()
-        post_hashtags = {_normalize_hashtag(tag) for tag in HASHTAG_RE.findall(post.text)}
-        if any(keyword in text for keyword in normalized_keywords) or any(
-            hashtag in post_hashtags for hashtag in normalized_hashtags
-        ):
-            filtered.append(post)
-
-    return filtered
+    groups: list[tuple[str, ...]] = [(keyword,) for keyword in keywords if keyword.strip()]
+    groups.extend((hashtag,) for hashtag in hashtags if hashtag.strip())
+    return filter_posts_by_groups(posts, groups)
 
 
 def remove_posts_linked_from_ff(posts: Iterable[Post], ff_links: Iterable[str]) -> list[Post]:

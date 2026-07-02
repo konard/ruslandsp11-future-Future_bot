@@ -3,18 +3,21 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
-from future_bot.config import Settings, load_source_groups_file, load_terms_file
+from future_bot.config import CommandLine, Settings, load_command_lines, load_source_groups_file
 from future_bot.logic import (
     ControlCommand,
     IncomingMessage,
     Post,
     dedupe_posts,
-    filter_posts_by_terms,
+    filter_posts_by_groups,
+    flatten_terms,
+    format_groups,
     format_numbered_links,
     parse_control_command,
     parse_search_command,
@@ -92,6 +95,7 @@ class FutureBotService:
         self._search_stop_event = threading.Event()
         self._shutdown_event = threading.Event()
         self._source_posts_cache: _SourcePostsCache | None = None
+        self._search_executor: ThreadPoolExecutor | None = None
 
     @property
     def search_stop_requested(self) -> bool:
@@ -118,8 +122,7 @@ class FutureBotService:
     def run_once(
         self,
         now: datetime | None = None,
-        keywords: Sequence[str] | None = None,
-        hashtags: Sequence[str] | None = None,
+        groups: Sequence[Sequence[str]] | None = None,
         interval_days: int = 1,
         peer_id: int | None = None,
         include_summary: bool = False,
@@ -129,10 +132,9 @@ class FutureBotService:
         with self._run_lock:
             self._search_stop_event.clear()
             try:
-                return self._run_once(
+                results = self._run_search(
                     now=now,
-                    keywords=keywords,
-                    hashtags=hashtags,
+                    groups=groups,
                     interval_days=interval_days,
                     peer_id=peer_id,
                     include_summary=include_summary,
@@ -141,18 +143,32 @@ class FutureBotService:
                 )
             finally:
                 self._search_stop_event.clear()
+        return _aggregate_results(results, interval_days=interval_days)
 
-    def _run_once(
+    def _resolve_queries(self, groups: Sequence[Sequence[str]] | None) -> list[CommandLine]:
+        """Определяет список поисковых команд.
+
+        Явно заданные группы образуют одну команду. Пустой запрос (например
+        ``/поиск по () интервал 1д``) и запуск по таймеру разворачиваются в
+        перечень команд из файла ``Список слов и хэштегов.txt`` - по одной
+        команде на строку с отдельным отчетом.
+        """
+
+        normalized = tuple(tuple(term for term in group) for group in (groups or ()) if group)
+        if normalized:
+            return [CommandLine(raw=format_groups(normalized), groups=normalized)]
+        return load_command_lines(self.settings.terms_file)
+
+    def _run_search(
         self,
         now: datetime | None = None,
-        keywords: Sequence[str] | None = None,
-        hashtags: Sequence[str] | None = None,
+        groups: Sequence[Sequence[str]] | None = None,
         interval_days: int = 1,
         peer_id: int | None = None,
         include_summary: bool = False,
         show_progress: bool = False,
         use_source_cache: bool = False,
-    ) -> SyncResult:
+    ) -> list[SyncResult]:
         if interval_days <= 0:
             raise ValueError("Интервал поиска должен быть больше нуля")
 
@@ -160,6 +176,10 @@ class FutureBotService:
         target_peer_id = peer_id or self.settings.target_peer_id
         source_since_timestamp = int((current_time - timedelta(days=interval_days)).timestamp())
         source_groups = load_source_groups_file(self.settings.source_groups_file)
+        queries = self._resolve_queries(groups)
+        all_keywords = flatten_terms(
+            [group for query in queries for group in query.groups]
+        )
         progress_started_at = current_time
         progress = (
             _ProgressMessage.start(
@@ -178,22 +198,12 @@ class FutureBotService:
         )
 
         try:
-            effective_keywords = tuple(keywords or ())
-            effective_hashtags = tuple(hashtags or ())
-            if effective_keywords and hashtags is None:
-                effective_hashtags = tuple(
-                    f"#{keyword.lstrip('#')}" for keyword in effective_keywords if keyword.lstrip("#")
-                )
-            if not effective_keywords and not effective_hashtags:
-                terms = load_terms_file(self.settings.terms_file)
-                effective_keywords = terms.keywords
-                effective_hashtags = terms.hashtags
-
             ff_full_import = not self.storage.has_ff_posts()
             ff_since = None if ff_full_import else self.storage.get_latest_ff_post_date()
             failed_groups: list[str] = []
             ff_posts = self._collect_wall_posts(self.settings.ff_group, ff_since, failed_groups)
             self.storage.upsert_ff_posts(ff_posts)
+            self._prune_old_posts(current_time)
             LOGGER.info("Сохранено постов Формулы Футурологии: %s", len(ff_posts))
 
             source_posts: list[Post] = []
@@ -220,18 +230,20 @@ class FutureBotService:
             else:
                 for group in source_groups:
                     if self.search_stop_requested:
-                        return self._finish_stopped_search(
-                            progress=progress,
-                            peer_id=target_peer_id,
-                            ff_full_import=ff_full_import,
-                            ff_posts_seen=len(ff_posts),
-                            source_posts_seen=len(dedupe_posts(source_posts)),
-                            keywords=effective_keywords,
-                            interval_days=interval_days,
-                            checked_groups=checked_groups,
-                            total_groups=len(source_groups),
-                            failed_groups=failed_groups,
-                        )
+                        return [
+                            self._finish_stopped_search(
+                                progress=progress,
+                                peer_id=target_peer_id,
+                                ff_full_import=ff_full_import,
+                                ff_posts_seen=len(ff_posts),
+                                source_posts_seen=len(dedupe_posts(source_posts)),
+                                keywords=all_keywords,
+                                interval_days=interval_days,
+                                checked_groups=checked_groups,
+                                total_groups=len(source_groups),
+                                failed_groups=failed_groups,
+                            )
+                        ]
 
                     group_posts = self._collect_wall_posts(group, source_since_timestamp, failed_groups)
                     LOGGER.info("Получено постов из %s: %s", group, len(group_posts))
@@ -251,18 +263,20 @@ class FutureBotService:
                         )
 
                     if self.search_stop_requested:
-                        return self._finish_stopped_search(
-                            progress=progress,
-                            peer_id=target_peer_id,
-                            ff_full_import=ff_full_import,
-                            ff_posts_seen=len(ff_posts),
-                            source_posts_seen=len(dedupe_posts(source_posts)),
-                            keywords=effective_keywords,
-                            interval_days=interval_days,
-                            checked_groups=checked_groups,
-                            total_groups=len(source_groups),
-                            failed_groups=failed_groups,
-                        )
+                        return [
+                            self._finish_stopped_search(
+                                progress=progress,
+                                peer_id=target_peer_id,
+                                ff_full_import=ff_full_import,
+                                ff_posts_seen=len(ff_posts),
+                                source_posts_seen=len(dedupe_posts(source_posts)),
+                                keywords=all_keywords,
+                                interval_days=interval_days,
+                                checked_groups=checked_groups,
+                                total_groups=len(source_groups),
+                                failed_groups=failed_groups,
+                            )
+                        ]
 
                 if use_source_cache:
                     self._source_posts_cache = _SourcePostsCache(
@@ -274,51 +288,82 @@ class FutureBotService:
                     )
 
             unique_source_posts = dedupe_posts(source_posts)
-            filtered_posts = filter_posts_by_terms(
-                unique_source_posts,
-                keywords=effective_keywords,
-                hashtags=effective_hashtags,
-            )
-            final_posts = remove_posts_linked_from_ff(filtered_posts, self.storage.get_ff_links())
-            final_posts = sorted(final_posts, key=lambda post: post.date, reverse=True)
-            self.storage.replace_new_posts(final_posts)
+            ff_links = self.storage.get_ff_links()
 
-            links_message = format_numbered_links(
-                final_posts,
-                empty_message=f"За последние {interval_days} д. новых постов по заданным критериям не найдено.",
-            )
-            if include_summary:
-                message = _format_sync_report(
-                    keywords=effective_keywords or effective_hashtags,
-                    interval_days=interval_days,
-                    ff_posts_seen=len(ff_posts),
-                    source_posts_seen=len(unique_source_posts),
-                    filtered_posts=len(filtered_posts),
-                    final_posts=len(final_posts),
-                    failed_groups=failed_groups,
+            results: list[SyncResult] = []
+            messages: list[str] = []
+            all_final_posts: list[Post] = []
+            for query in queries:
+                filtered_posts = filter_posts_by_groups(unique_source_posts, query.groups)
+                final_posts = remove_posts_linked_from_ff(filtered_posts, ff_links)
+                final_posts = sorted(final_posts, key=lambda post: post.date, reverse=True)
+                all_final_posts.extend(final_posts)
+
+                links_message = format_numbered_links(
+                    final_posts,
+                    empty_message=(
+                        f"За последние {interval_days} д. новых постов по запросу "
+                        f"«{query.raw}» не найдено."
+                    ),
                 )
-                message = f"{message}\n\n{links_message}"
-            else:
-                message = links_message
+                if include_summary:
+                    report = _format_sync_report(
+                        keywords_text=format_groups(query.groups) or query.raw,
+                        interval_days=interval_days,
+                        ff_posts_seen=len(ff_posts),
+                        source_posts_seen=len(unique_source_posts),
+                        filtered_posts=len(filtered_posts),
+                        final_posts=len(final_posts),
+                        failed_groups=failed_groups,
+                    )
+                    message = f"{report}\n\n{links_message}"
+                else:
+                    message = links_message
 
-            _finish_message(self.message_client, target_peer_id, message, progress)
+                messages.append(message)
+                results.append(
+                    SyncResult(
+                        ff_full_import=ff_full_import,
+                        ff_posts_seen=len(ff_posts),
+                        source_posts_seen=len(unique_source_posts),
+                        filtered_posts=len(filtered_posts),
+                        final_posts=len(final_posts),
+                        message=message,
+                        keywords=flatten_terms(query.groups),
+                        interval_days=interval_days,
+                        failed_groups=tuple(failed_groups),
+                    )
+                )
+
+            self.storage.replace_new_posts(dedupe_posts(all_final_posts))
+
+            for index, message in enumerate(messages):
+                _finish_message(
+                    self.message_client,
+                    target_peer_id,
+                    message,
+                    progress if index == 0 else None,
+                )
+
             self.storage.set_metadata("last_successful_sync_at", current_time.isoformat())
-
-            return SyncResult(
-                ff_full_import=ff_full_import,
-                ff_posts_seen=len(ff_posts),
-                source_posts_seen=len(unique_source_posts),
-                filtered_posts=len(filtered_posts),
-                final_posts=len(final_posts),
-                message=message,
-                keywords=effective_keywords,
-                interval_days=interval_days,
-                failed_groups=tuple(failed_groups),
-            )
+            return results
         except Exception as exc:
             if progress is not None:
                 self._finish_unexpected_progress_error(progress, exc)
             raise
+
+    def _prune_old_posts(self, current_time: datetime) -> None:
+        retention_days = self.settings.post_retention_days
+        if retention_days <= 0:
+            return
+        cutoff = int((current_time - timedelta(days=retention_days)).timestamp())
+        removed = self.storage.delete_posts_older_than(cutoff)
+        if removed:
+            LOGGER.info(
+                "Удалено устаревших постов ФФ (старше %s дней): %s",
+                retention_days,
+                removed,
+            )
 
     def handle_chat_message(
         self,
@@ -353,8 +398,7 @@ class FutureBotService:
         )
         return self.run_once(
             now=now,
-            keywords=command.keywords,
-            hashtags=command.hashtags,
+            groups=command.groups,
             interval_days=command.interval_days,
             peer_id=message.peer_id,
             include_summary=True,
@@ -362,7 +406,7 @@ class FutureBotService:
             use_source_cache=True,
         )
 
-    def poll_chat_once(self, now: datetime | None = None) -> int:
+    def poll_chat_once(self, now: datetime | None = None, background: bool = False) -> int:
         if self.chat_client is None:
             raise RuntimeError("Для проверки команд нужен клиент чата")
 
@@ -389,10 +433,69 @@ class FutureBotService:
 
             self.storage.set_metadata(metadata_key, str(message.sequence_id))
             last_processed = message.sequence_id
+
+            # Игнорируем команды, на которые уже ответила группа (другой экземпляр
+            # бота), чтобы несколько запусков не обрабатывали одну команду дважды.
+            if self._command_already_answered(message, messages):
+                if parse_control_command(message.text) or parse_search_command(message.text):
+                    LOGGER.info(
+                        "Команда %s пропущена: на нее уже ответила группа",
+                        message.sequence_id,
+                    )
+                continue
+
+            # Команды поиска выполняем в фоне, чтобы поток опроса чата продолжал
+            # читать сообщения и мог немедленно распознать «/стоп поиск».
+            # Команды управления обрабатываем сразу, синхронно.
+            if background and self._is_background_search(message):
+                self._submit_search(message, now)
+                handled_count += 1
+                continue
+
             if self.handle_chat_message(message, now=now) is not None:
                 handled_count += 1
 
         return handled_count
+
+    @staticmethod
+    def _command_already_answered(message: IncomingMessage, messages: Sequence[IncomingMessage]) -> bool:
+        """Проверяет, ответила ли уже группа на команду.
+
+        Ответ группы (сообщение от имени сообщества, ``from_id < 0``), пришедший
+        позже команды, означает, что команда уже обработана другим экземпляром
+        бота, поэтому ее следует пропустить.
+        """
+
+        return any(
+            other.sequence_id > message.sequence_id and other.from_id < 0
+            for other in messages
+        )
+
+    def _is_background_search(self, message: IncomingMessage) -> bool:
+        if parse_control_command(message.text) is not None:
+            return False
+        if parse_search_command(message.text) is None:
+            return False
+        return message.from_id in self.settings.allowed_user_ids
+
+    def _submit_search(self, message: IncomingMessage, now: datetime | None) -> None:
+        if self._search_executor is None:
+            self._search_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="ff-search"
+            )
+        self._search_executor.submit(self._safe_handle, message, now)
+
+    def _safe_handle(self, message: IncomingMessage, now: datetime | None) -> None:
+        try:
+            self.handle_chat_message(message, now=now)
+        except Exception:
+            LOGGER.exception("Ошибка при фоновой обработке команды поиска")
+
+    def shutdown_executor(self) -> None:
+        executor = self._search_executor
+        if executor is not None:
+            executor.shutdown(wait=False)
+            self._search_executor = None
 
     def _get_source_posts_cache(
         self,
@@ -477,8 +580,44 @@ class FutureBotService:
         )
 
 
+def _aggregate_results(results: Sequence[SyncResult], interval_days: int) -> SyncResult:
+    """Сводит отчеты по нескольким запросам в один результат.
+
+    Возвращается вызывающему коду (планировщик, ``__main__``), тогда как
+    пользователю в чат отправляется отдельный отчет по каждому запросу.
+    """
+
+    if not results:
+        return SyncResult(
+            ff_full_import=False,
+            ff_posts_seen=0,
+            source_posts_seen=0,
+            filtered_posts=0,
+            final_posts=0,
+            message="",
+            keywords=(),
+            interval_days=interval_days,
+        )
+    if len(results) == 1:
+        return results[0]
+
+    first = results[0]
+    return SyncResult(
+        ff_full_import=first.ff_full_import,
+        ff_posts_seen=first.ff_posts_seen,
+        source_posts_seen=first.source_posts_seen,
+        filtered_posts=sum(result.filtered_posts for result in results),
+        final_posts=sum(result.final_posts for result in results),
+        message="\n\n".join(result.message for result in results),
+        keywords=flatten_terms([result.keywords for result in results]),
+        interval_days=interval_days,
+        failed_groups=first.failed_groups,
+        stopped=any(result.stopped for result in results),
+    )
+
+
 def _format_sync_report(
-    keywords: Sequence[str],
+    keywords_text: str,
     interval_days: int,
     ff_posts_seen: int,
     source_posts_seen: int,
@@ -488,7 +627,7 @@ def _format_sync_report(
 ) -> str:
     lines = [
         "Поиск выполнен.",
-        f"Ключевые слова: {', '.join(keywords)}.",
+        f"Ключевые слова: {keywords_text}.",
         f"Интервал: {interval_days} д.",
         f"Постов ФФ загружено: {ff_posts_seen}.",
         f"Постов источников проверено: {source_posts_seen}.",
