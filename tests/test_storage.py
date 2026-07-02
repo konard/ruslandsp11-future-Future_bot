@@ -1,5 +1,5 @@
 from future_bot.logic import Post
-from future_bot.storage import Storage
+from future_bot.storage import FF_POSTS_TABLE, NEW_POSTS_TABLE, Storage
 
 
 def test_storage_keeps_ff_links_and_replaces_new_posts(tmp_path):
@@ -37,7 +37,7 @@ def test_storage_keeps_ff_links_and_replaces_new_posts(tmp_path):
     assert storage.list_new_posts() == []
 
 
-def test_delete_posts_older_than_removes_only_stale_ff_posts(tmp_path):
+def test_delete_posts_older_than_removes_only_stale_posts_from_given_table(tmp_path):
     storage = Storage(tmp_path / "future_bot.sqlite3")
     storage.upsert_ff_posts(
         [
@@ -46,8 +46,23 @@ def test_delete_posts_older_than_removes_only_stale_ff_posts(tmp_path):
         ]
     )
 
-    removed = storage.delete_posts_older_than(200)
+    removed = storage.delete_posts_older_than(200, table=FF_POSTS_TABLE)
 
     assert removed == 1
     assert storage.get_latest_ff_post_date() == 500
     assert storage.get_ff_links() == set()
+
+
+def test_delete_posts_older_than_can_target_new_posts_table(tmp_path):
+    storage = Storage(tmp_path / "future_bot.sqlite3")
+    storage.replace_new_posts(
+        [
+            Post(owner_id=-1, post_id=1, source_group="eofru", date=100, text="старый"),
+            Post(owner_id=-1, post_id=2, source_group="eofru", date=500, text="свежий"),
+        ]
+    )
+
+    removed = storage.delete_posts_older_than(200, table=NEW_POSTS_TABLE)
+
+    assert removed == 1
+    assert [post.post_id for post in storage.list_new_posts()] == [2]
