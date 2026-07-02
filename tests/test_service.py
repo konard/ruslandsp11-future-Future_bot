@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+import threading
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -96,7 +97,7 @@ def test_run_once_builds_ff_database_filters_dedupes_and_sends_digest(tmp_path):
         owner_id=-10,
         post_id=1,
         source_group="world_of_futuristica",
-        date=100,
+        date=int(datetime(2026, 6, 27, 3, 0, tzinfo=timezone.utc).timestamp()),
         text="Уже опубликовано",
         links=("https://vk.com/wall-20_1",),
     )
@@ -370,11 +371,17 @@ def test_empty_chat_search_command_uses_terms_file(tmp_path):
         now=datetime(2026, 6, 28, 12, 0, tzinfo=timezone.utc),
     )
 
+    # Каждая строка файла - отдельная команда с отдельным отчетом.
     assert result is not None
-    assert result.keywords == ("ИИ",)
+    assert result.keywords == ("ИИ", "#роботы")
+    assert result.final_posts == 1
     assert wall_client.calls[-1][0] == "eofru"
+    # Первый отчет (строка «ИИ») отправлен правкой сообщения о прогрессе.
     assert "Ключевые слова: ИИ." in message_client.edits[-1][2]
-    assert "1. https://vk.com/wall-20_5" in message_client.edits[-1][2]
+    # Второй отчет (строка «#роботы») содержит найденную ссылку.
+    second_report = message_client.sent[-1][1]
+    assert "Ключевые слова: #роботы." in second_report
+    assert "1. https://vk.com/wall-20_5" in second_report
 
 
 def test_handle_chat_search_command_denies_unlisted_user(tmp_path):
@@ -814,6 +821,209 @@ def test_allowed_stop_commands_request_search_stop_and_shutdown(tmp_path):
         (2_000_000_015, "Остановка поиска запрошена."),
         (2_000_000_015, "Остановка программы запрошена."),
     ]
+
+
+def test_run_once_prunes_ff_posts_older_than_retention(tmp_path):
+    groups_file, terms_file = write_runtime_lists(tmp_path, ("eofru",), ("Технология",))
+    settings = Settings(
+        vk_group_token="group-token",
+        vk_user_token="user-token",
+        vk_message_token="group-token",
+        database_path=tmp_path / "future_bot.sqlite3",
+        ff_group="world_of_futuristica",
+        source_groups_file=groups_file,
+        terms_file=terms_file,
+        post_retention_days=10,
+        timezone="UTC",
+    )
+    now = datetime(2026, 6, 28, 3, 0, tzinfo=timezone.utc)
+    stale_date = int((now - timedelta(days=20)).timestamp())
+    fresh_date = int((now - timedelta(days=2)).timestamp())
+    storage = Storage(settings.database_path)
+    storage.upsert_ff_posts(
+        [
+            Post(
+                owner_id=-10,
+                post_id=1,
+                source_group="world_of_futuristica",
+                date=stale_date,
+                text="Старый пост",
+                links=("https://vk.com/wall-1_1",),
+            ),
+            Post(
+                owner_id=-10,
+                post_id=2,
+                source_group="world_of_futuristica",
+                date=fresh_date,
+                text="Свежий пост",
+                links=("https://vk.com/wall-2_2",),
+            ),
+        ]
+    )
+    wall_client = FakeWallClient({"world_of_futuristica": [], "eofru": []})
+    message_client = FakeMessageClient()
+    service = FutureBotService(settings, wall_client, message_client, storage)
+
+    service.run_once(now=now)
+
+    assert storage.get_ff_links() == {"https://vk.com/wall-2_2"}
+    assert storage.get_latest_ff_post_date() == fresh_date
+
+
+def test_timer_search_runs_each_terms_file_line_as_separate_report(tmp_path):
+    groups_file, terms_file = write_runtime_lists(
+        tmp_path,
+        ("eofru",),
+        ("ИИ", "антилопы"),
+    )
+    settings = Settings(
+        vk_group_token="group-token",
+        vk_user_token="user-token",
+        vk_message_token="group-token",
+        database_path=tmp_path / "future_bot.sqlite3",
+        ff_group="world_of_futuristica",
+        source_groups_file=groups_file,
+        terms_file=terms_file,
+        target_peer_id=2_000_000_050,
+        timezone="UTC",
+    )
+    wall_client = FakeWallClient(
+        {
+            "world_of_futuristica": [],
+            "eofru": [
+                Post(owner_id=-20, post_id=1, source_group="eofru", date=300, text="Развитие ИИ"),
+                Post(owner_id=-30, post_id=2, source_group="eofru", date=301, text="Стадо антилопы"),
+            ],
+        }
+    )
+    message_client = FakeMessageClient()
+    service = FutureBotService(settings, wall_client, message_client, Storage(settings.database_path))
+
+    result = service.run_once(
+        now=datetime(2026, 6, 28, 3, 0, tzinfo=timezone.utc),
+        include_summary=True,
+    )
+
+    assert result.keywords == ("ИИ", "антилопы")
+    assert result.final_posts == 2
+    reports = [message for _, message in message_client.sent]
+    assert len(reports) == 2
+    assert any("Ключевые слова: ИИ." in report and "wall-20_1" in report for report in reports)
+    assert any("Ключевые слова: антилопы." in report and "wall-30_2" in report for report in reports)
+
+
+def test_poll_chat_skips_command_already_answered_by_group(tmp_path):
+    groups_file, terms_file = write_runtime_lists(tmp_path, ("eofru",))
+    settings = Settings(
+        vk_group_token="group-token",
+        vk_user_token="user-token",
+        vk_message_token="group-token",
+        database_path=tmp_path / "future_bot.sqlite3",
+        ff_group="world_of_futuristica",
+        source_groups_file=groups_file,
+        terms_file=terms_file,
+        target_peer_id=2_000_000_099,
+        allowed_user_ids=(199592366,),
+        timezone="UTC",
+    )
+    command = IncomingMessage(
+        peer_id=2_000_000_099,
+        from_id=199592366,
+        text="/поиск по (Технология) интервал 1д",
+        date=1,
+        conversation_message_id=7,
+    )
+    group_reply = IncomingMessage(
+        peer_id=2_000_000_099,
+        from_id=-555,
+        text="Поиск выполнен.",
+        date=2,
+        conversation_message_id=8,
+    )
+    chat_client = FakeChatClient(peer_id=2_000_000_099, messages=[command, group_reply])
+    wall_client = FakeWallClient({"world_of_futuristica": [], "eofru": []})
+    message_client = FakeMessageClient()
+    storage = Storage(settings.database_path)
+    storage.set_metadata("last_processed_message_sequence:2000000099", "6")
+    service = FutureBotService(
+        settings,
+        wall_client,
+        message_client,
+        storage,
+        chat_client=chat_client,
+    )
+
+    handled_count = service.poll_chat_once(now=datetime(2026, 6, 28, 3, 0, tzinfo=timezone.utc))
+
+    assert handled_count == 0
+    assert wall_client.calls == []
+    assert storage.get_metadata("last_processed_message_sequence:2000000099") == "8"
+
+
+def test_background_poll_handles_stop_without_waiting_for_running_search(tmp_path):
+    groups_file, terms_file = write_runtime_lists(tmp_path, ("eofru",), ("Технология",))
+    settings = Settings(
+        vk_group_token="group-token",
+        vk_user_token="user-token",
+        vk_message_token="group-token",
+        database_path=tmp_path / "future_bot.sqlite3",
+        ff_group="world_of_futuristica",
+        source_groups_file=groups_file,
+        terms_file=terms_file,
+        target_peer_id=2_000_000_099,
+        allowed_user_ids=(199592366,),
+        timezone="UTC",
+    )
+    release = threading.Event()
+
+    class BlockingWallClient(FakeWallClient):
+        def iter_wall_posts(self, group, since_timestamp=None):
+            release.wait(timeout=5)
+            return super().iter_wall_posts(group, since_timestamp)
+
+    search = IncomingMessage(
+        peer_id=2_000_000_099,
+        from_id=199592366,
+        text="/поиск по (Технология) интервал 1д",
+        date=1,
+        conversation_message_id=7,
+    )
+    stop = IncomingMessage(
+        peer_id=2_000_000_099,
+        from_id=199592366,
+        text="/стоп поиск",
+        date=2,
+        conversation_message_id=8,
+    )
+    chat_client = FakeChatClient(peer_id=2_000_000_099, messages=[search, stop])
+    wall_client = BlockingWallClient({"world_of_futuristica": [], "eofru": []})
+    message_client = FakeMessageClient()
+    storage = Storage(settings.database_path)
+    storage.set_metadata("last_processed_message_sequence:2000000099", "6")
+    service = FutureBotService(
+        settings,
+        wall_client,
+        message_client,
+        storage,
+        chat_client=chat_client,
+    )
+
+    try:
+        handled_count = service.poll_chat_once(
+            now=datetime(2026, 6, 28, 3, 0, tzinfo=timezone.utc),
+            background=True,
+        )
+
+        # Команда поиска выполняется в фоне, поэтому «/стоп поиск» обработана
+        # немедленно, не дожидаясь завершения поиска.
+        assert handled_count == 2
+        assert service.search_stop_requested is True
+        assert any(message == "Остановка поиска запрошена." for _, message in message_client.sent)
+    finally:
+        release.set()
+        executor = service._search_executor
+        if executor is not None:
+            executor.shutdown(wait=True)
 
 
 def test_run_once_stops_before_next_source_group_when_stop_requested(tmp_path):

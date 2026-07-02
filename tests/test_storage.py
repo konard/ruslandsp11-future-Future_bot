@@ -35,3 +35,19 @@ def test_storage_keeps_ff_links_and_replaces_new_posts(tmp_path):
     storage.replace_new_posts([])
 
     assert storage.list_new_posts() == []
+
+
+def test_delete_posts_older_than_removes_only_stale_ff_posts(tmp_path):
+    storage = Storage(tmp_path / "future_bot.sqlite3")
+    storage.upsert_ff_posts(
+        [
+            Post(owner_id=-1, post_id=1, source_group="ff", date=100, text="старый"),
+            Post(owner_id=-1, post_id=2, source_group="ff", date=500, text="свежий"),
+        ]
+    )
+
+    removed = storage.delete_posts_older_than(200)
+
+    assert removed == 1
+    assert storage.get_latest_ff_post_date() == 500
+    assert storage.get_ff_links() == set()
