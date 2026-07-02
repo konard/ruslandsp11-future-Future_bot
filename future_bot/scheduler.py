@@ -49,7 +49,9 @@ def run_forever(service: FutureBotService, settings: Settings) -> None:
 def poll_chat_forever(service: FutureBotService, settings: Settings) -> None:
     while not service.shutdown_requested:
         try:
-            handled_count = service.poll_chat_once()
+            # background=True: команды поиска выполняются в отдельном потоке,
+            # поэтому поток опроса не блокируется и сразу распознает «/стоп поиск».
+            handled_count = service.poll_chat_once(background=True)
             if handled_count:
                 LOGGER.info("Обработано команд поиска: %s", handled_count)
         except Exception:
