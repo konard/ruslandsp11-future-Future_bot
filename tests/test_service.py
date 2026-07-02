@@ -823,7 +823,7 @@ def test_allowed_stop_commands_request_search_stop_and_shutdown(tmp_path):
     ]
 
 
-def test_run_once_prunes_ff_posts_older_than_retention(tmp_path):
+def test_run_once_never_prunes_ff_posts_by_age(tmp_path):
     groups_file, terms_file = write_runtime_lists(tmp_path, ("eofru",), ("Технология",))
     settings = Settings(
         vk_group_token="group-token",
@@ -866,8 +866,48 @@ def test_run_once_prunes_ff_posts_older_than_retention(tmp_path):
 
     service.run_once(now=now)
 
-    assert storage.get_ff_links() == {"https://vk.com/wall-2_2"}
+    assert storage.get_ff_links() == {
+        "https://vk.com/wall-1_1",
+        "https://vk.com/wall-2_2",
+    }
     assert storage.get_latest_ff_post_date() == fresh_date
+
+
+def test_run_once_prunes_new_posts_older_than_retention(tmp_path):
+    groups_file, terms_file = write_runtime_lists(tmp_path, ("eofru",), ("Технология",))
+    settings = Settings(
+        vk_group_token="group-token",
+        vk_user_token="user-token",
+        vk_message_token="group-token",
+        database_path=tmp_path / "future_bot.sqlite3",
+        ff_group="world_of_futuristica",
+        source_groups_file=groups_file,
+        terms_file=terms_file,
+        post_retention_days=10,
+        timezone="UTC",
+    )
+    now = datetime(2026, 6, 28, 3, 0, tzinfo=timezone.utc)
+    stale_date = int((now - timedelta(days=20)).timestamp())
+    storage = Storage(settings.database_path)
+    storage.replace_new_posts(
+        [
+            Post(
+                owner_id=-20,
+                post_id=1,
+                source_group="eofru",
+                date=stale_date,
+                text="Старый оставшийся пост",
+                links=("https://vk.com/wall-20_1",),
+            ),
+        ]
+    )
+    wall_client = FakeWallClient({"world_of_futuristica": [], "eofru": []})
+    message_client = FakeMessageClient()
+    service = FutureBotService(settings, wall_client, message_client, storage)
+
+    service._prune_old_posts(now)
+
+    assert storage.list_new_posts() == []
 
 
 def test_timer_search_runs_each_terms_file_line_as_separate_report(tmp_path):

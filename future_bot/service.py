@@ -23,7 +23,7 @@ from future_bot.logic import (
     parse_search_command,
     remove_posts_linked_from_ff,
 )
-from future_bot.storage import Storage
+from future_bot.storage import NEW_POSTS_TABLE, Storage
 
 LOGGER = logging.getLogger(__name__)
 MAX_VK_MESSAGE_LENGTH = 4000
@@ -353,14 +353,20 @@ class FutureBotService:
             raise
 
     def _prune_old_posts(self, current_time: datetime) -> None:
+        """Удаляет устаревшие записи только из базы новых постов.
+
+        База постов ФФ используется для дедупликации и должна только
+        дополняться постами группы ФФ — её записи по возрасту не удаляются.
+        """
+
         retention_days = self.settings.post_retention_days
         if retention_days <= 0:
             return
         cutoff = int((current_time - timedelta(days=retention_days)).timestamp())
-        removed = self.storage.delete_posts_older_than(cutoff)
+        removed = self.storage.delete_posts_older_than(cutoff, table=NEW_POSTS_TABLE)
         if removed:
             LOGGER.info(
-                "Удалено устаревших постов ФФ (старше %s дней): %s",
+                "Удалено устаревших постов из базы новых постов (старше %s дней): %s",
                 retention_days,
                 removed,
             )
