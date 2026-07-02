@@ -6,6 +6,8 @@ from datetime import time
 from pathlib import Path
 from urllib.parse import urlparse
 
+from future_bot.logic import parse_query_groups
+
 DEFAULT_SOURCE_GROUPS_FILE = Path("Список групп.txt")
 DEFAULT_TERMS_FILE = Path("Список слов и хэштегов.txt")
 
@@ -21,6 +23,14 @@ class SearchTerms:
 
 
 @dataclass(frozen=True)
+class CommandLine:
+    """Одна строка файла команд: исходный текст и разобранные группы слов."""
+
+    raw: str
+    groups: tuple[tuple[str, ...], ...]
+
+
+@dataclass(frozen=True)
 class Settings:
     vk_group_token: str
     vk_user_token: str
@@ -33,6 +43,7 @@ class Settings:
     target_chat_title: str = "Аналитика и прогнозы"
     allowed_user_ids: tuple[int, ...] = (199592366, 1849091)
     command_poll_interval_seconds: float = 10.0
+    post_retention_days: int = 10
     schedule_time: time = time(3, 0)
     timezone: str = "Europe/Moscow"
     vk_api_version: str = "5.199"
@@ -70,6 +81,9 @@ class Settings:
             target_chat_title=env.get("FFBOT_TARGET_CHAT_TITLE", "Аналитика и прогнозы"),
             allowed_user_ids=parse_int_csv(env.get("FFBOT_ALLOWED_USER_IDS", "199592366,1849091")),
             command_poll_interval_seconds=float(env.get("FFBOT_COMMAND_POLL_INTERVAL_SECONDS", "10")),
+            post_retention_days=parse_positive_int(
+                env.get("FFBOT_POST_RETENTION_DAYS", "10"), "FFBOT_POST_RETENTION_DAYS"
+            ),
             schedule_time=parse_hhmm(env.get("FFBOT_SCHEDULE_TIME", "03:00")),
             timezone=env.get("FFBOT_TIMEZONE", "Europe/Moscow"),
             vk_api_version=env.get("VK_API_VERSION", "5.199"),
@@ -120,6 +134,30 @@ def load_terms_file(path: Path) -> SearchTerms:
     return SearchTerms(keywords=tuple(dedupe_keep_order(keywords)), hashtags=tuple(dedupe_keep_order(hashtags)))
 
 
+def load_command_lines(path: Path) -> list[CommandLine]:
+    """Читает файл команд: каждая непустая строка - отдельная команда.
+
+    В строке запятая разделяет группы (логическое ИЛИ), а ``+`` объединяет
+    слова в одну группу (логическое И). Строки без слов пропускаются.
+    """
+
+    if not path.exists():
+        raise ConfigError(f"Файл не найден: {path}")
+
+    commands: list[CommandLine] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        groups = parse_query_groups(line)
+        if groups:
+            commands.append(CommandLine(raw=line, groups=groups))
+
+    if not commands:
+        raise ConfigError(f"Файл со списком слов и хэштегов пуст: {path}")
+    return commands
+
+
 def read_list_file(path: Path, allow_hash_items: bool = False) -> list[str]:
     if not path.exists():
         raise ConfigError(f"Файл не найден: {path}")
@@ -147,6 +185,16 @@ def dedupe_keep_order(values: list[str]) -> list[str]:
             continue
         seen.add(key)
         result.append(value)
+    return result
+
+
+def parse_positive_int(value: str, name: str) -> int:
+    try:
+        result = int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"Некорректное значение {name}: {value!r}. Ожидается целое число.") from exc
+    if result <= 0:
+        raise ConfigError(f"Значение {name} должно быть больше нуля, получено {result}.")
     return result
 
 
