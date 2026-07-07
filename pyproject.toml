@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "future-bot"
-version = "0.3.0"
+version = "0.4.0"
 description = "Daily VK post digest bot for Formula Futurology."
 readme = "README.md"
 requires-python = ">=3.11"

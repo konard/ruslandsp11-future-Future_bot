@@ -148,6 +148,56 @@ def test_run_once_builds_ff_database_filters_dedupes_and_sends_digest(tmp_path):
     assert wall_client.calls[0] == ("world_of_futuristica", None)
 
 
+def test_run_once_excludes_posts_already_liked_by_user_account(tmp_path):
+    groups_file, terms_file = write_runtime_lists(
+        tmp_path,
+        ("eofru",),
+        ("Технология",),
+    )
+    settings = Settings(
+        vk_group_token="group-token",
+        vk_user_token="user-token",
+        vk_message_token="user-token",
+        database_path=tmp_path / "future_bot.sqlite3",
+        ff_group="world_of_futuristica",
+        source_groups_file=groups_file,
+        terms_file=terms_file,
+        target_peer_id=2_000_000_170,
+        timezone="UTC",
+    )
+    liked_post = Post(
+        owner_id=-30,
+        post_id=1,
+        source_group="eofru",
+        date=200,
+        text="Новая технология",
+        liked=True,
+    )
+    not_liked_post = Post(
+        owner_id=-30,
+        post_id=2,
+        source_group="eofru",
+        date=300,
+        text="Свежая технология",
+        liked=False,
+    )
+    wall_client = FakeWallClient(
+        {
+            "world_of_futuristica": [],
+            "eofru": [liked_post, not_liked_post],
+        }
+    )
+    message_client = FakeMessageClient()
+
+    service = FutureBotService(settings, wall_client, message_client, Storage(settings.database_path))
+    result = service.run_once(now=datetime(2026, 6, 28, 3, 0, tzinfo=timezone.utc))
+
+    assert result.final_posts == 1
+    assert message_client.sent == [
+        (2_000_000_170, "1. https://vk.com/wall-30_2"),
+    ]
+
+
 def test_run_once_refreshes_ff_posts_from_latest_stored_date(tmp_path):
     groups_file, terms_file = write_runtime_lists(tmp_path, ("eofru",))
     settings = Settings(

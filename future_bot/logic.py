@@ -30,6 +30,7 @@ class Post:
     text: str
     source_url: str | None = None
     links: Sequence[str] = field(default_factory=tuple)
+    liked: bool = False
     raw: Mapping[str, Any] | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -56,6 +57,7 @@ class Post:
             text=str(item.get("text") or ""),
             source_url=post_url(owner_id, post_id),
             links=links_from_vk_item(item),
+            liked=is_liked_by_user(item),
             raw=item,
         )
 
@@ -289,6 +291,26 @@ def filter_posts_by_terms(
     groups: list[tuple[str, ...]] = [(keyword,) for keyword in keywords if keyword.strip()]
     groups.extend((hashtag,) for hashtag in hashtags if hashtag.strip())
     return filter_posts_by_groups(posts, groups)
+
+
+def is_liked_by_user(item: Mapping[str, Any]) -> bool:
+    """Определяет, поставлен ли лайк постом от лица владельца ``VK_USER_TOKEN``.
+
+    VK API возвращает в ``wall.get`` поле ``likes.user_likes`` только для
+    пользователя, чьим токеном выполнен запрос, поэтому лайк отражает мнение
+    именно того аккаунта, которым бот читает стены источников.
+    """
+
+    likes = item.get("likes")
+    if not isinstance(likes, Mapping):
+        return False
+    return bool(likes.get("user_likes"))
+
+
+def remove_liked_posts(posts: Iterable[Post]) -> list[Post]:
+    """Убирает из результата посты, уже отмеченные лайком."""
+
+    return [post for post in posts if not post.liked]
 
 
 def remove_posts_linked_from_ff(posts: Iterable[Post], ff_links: Iterable[str]) -> list[Post]:

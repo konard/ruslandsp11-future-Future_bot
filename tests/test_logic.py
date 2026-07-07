@@ -9,6 +9,7 @@ from future_bot.logic import (
     parse_control_command,
     parse_query_groups,
     parse_search_command,
+    remove_liked_posts,
     remove_posts_linked_from_ff,
 )
 
@@ -140,6 +141,53 @@ def test_remove_posts_whose_source_url_is_already_linked_from_ff_posts():
     remaining = remove_posts_linked_from_ff(posts, {"https://vk.com/wall-100_200"})
 
     assert [post.source_url for post in remaining] == ["https://vk.com/wall-300_400"]
+
+
+def test_remove_liked_posts_drops_only_posts_marked_as_liked():
+    posts = [
+        Post(
+            owner_id=-1,
+            post_id=1,
+            source_group="eofru",
+            date=1,
+            text="Новая технология",
+            liked=True,
+        ),
+        Post(
+            owner_id=-2,
+            post_id=2,
+            source_group="asimovonline",
+            date=2,
+            text="Другая технология",
+            liked=False,
+        ),
+    ]
+
+    remaining = remove_liked_posts(posts)
+
+    assert [post.post_id for post in remaining] == [2]
+
+
+def test_post_from_vk_item_marks_post_as_liked_from_user_likes_field():
+    liked_item = {
+        "owner_id": -1,
+        "id": 1,
+        "date": 1,
+        "text": "Технология",
+        "likes": {"count": 3, "user_likes": 1},
+    }
+    not_liked_item = {
+        "owner_id": -1,
+        "id": 2,
+        "date": 2,
+        "text": "Технология",
+        "likes": {"count": 3, "user_likes": 0},
+    }
+    no_likes_item = {"owner_id": -1, "id": 3, "date": 3, "text": "Технология"}
+
+    assert Post.from_vk_item(liked_item, "eofru").liked is True
+    assert Post.from_vk_item(not_liked_item, "eofru").liked is False
+    assert Post.from_vk_item(no_likes_item, "eofru").liked is False
 
 
 def test_format_numbered_links_and_empty_result_message():

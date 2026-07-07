@@ -21,6 +21,7 @@ from future_bot.logic import (
     format_numbered_links,
     parse_control_command,
     parse_search_command,
+    remove_liked_posts,
     remove_posts_linked_from_ff,
 )
 from future_bot.storage import NEW_POSTS_TABLE, Storage
@@ -296,6 +297,7 @@ class FutureBotService:
             for query in queries:
                 filtered_posts = filter_posts_by_groups(unique_source_posts, query.groups)
                 final_posts = remove_posts_linked_from_ff(filtered_posts, ff_links)
+                final_posts = remove_liked_posts(final_posts)
                 final_posts = sorted(final_posts, key=lambda post: post.date, reverse=True)
                 all_final_posts.extend(final_posts)
 
