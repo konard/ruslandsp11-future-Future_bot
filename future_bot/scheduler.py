@@ -41,7 +41,7 @@ def run_forever(service: FutureBotService, settings: Settings) -> None:
         if service.wait_for_shutdown(delay):
             break
         try:
-            service.run_once()
+            service.run_once(include_summary=True)
         except Exception:
             LOGGER.exception("Ошибка плановой синхронизации")
 
