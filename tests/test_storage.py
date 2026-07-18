@@ -66,3 +66,20 @@ def test_delete_posts_older_than_can_target_new_posts_table(tmp_path):
 
     assert removed == 1
     assert [post.post_id for post in storage.list_new_posts()] == [2]
+
+
+def test_add_new_posts_accumulates_records_and_reports_known_urls(tmp_path):
+    storage = Storage(tmp_path / "future_bot.sqlite3")
+
+    storage.add_new_posts(
+        [Post(owner_id=-1, post_id=1, source_group="eofru", date=100, text="первый")]
+    )
+    storage.add_new_posts(
+        [Post(owner_id=-1, post_id=2, source_group="eofru", date=200, text="второй")]
+    )
+
+    assert sorted(post.post_id for post in storage.list_new_posts()) == [1, 2]
+    assert storage.get_new_post_urls() == {
+        "https://vk.com/wall-1_1",
+        "https://vk.com/wall-1_2",
+    }

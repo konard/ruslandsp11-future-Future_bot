@@ -83,6 +83,27 @@ class Storage:
             self._upsert_posts(connection, NEW_POSTS_TABLE, post_list)
         return len(post_list)
 
+    def add_new_posts(self, posts: Iterable[Post]) -> int:
+        """Дополняет `База новых постов`, не стирая прежние записи.
+
+        Накопленные записи нужны для проверки, не выдавался ли пост раньше по
+        другому слову; устаревшие записи удаляет ретенция
+        (``delete_posts_older_than``).
+        """
+
+        post_list = list(posts)
+        with self._connect() as connection:
+            self._upsert_posts(connection, NEW_POSTS_TABLE, post_list)
+        return len(post_list)
+
+    def get_new_post_urls(self) -> set[str]:
+        """Ссылки на посты, уже записанные в `База новых постов`."""
+
+        with self._connect() as connection:
+            rows = connection.execute(f"SELECT source_url FROM {NEW_POSTS_TABLE}").fetchall()
+
+        return {normalized for row in rows if (normalized := normalize_url(row["source_url"]))}
+
     def delete_posts_older_than(self, cutoff_timestamp: int, table: str) -> int:
         """Удаляет из таблицы посты старше ``cutoff_timestamp`` (unix-время).
 

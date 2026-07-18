@@ -30,8 +30,13 @@ def main() -> int:
 
     from future_bot.vk_client import VKClient
 
-    wall_client = VKClient(settings.vk_user_token, api_version=settings.vk_api_version)
-    message_client = VKClient(settings.vk_message_token, api_version=settings.vk_api_version)
+    client_options = {
+        "api_version": settings.vk_api_version,
+        "ca_bundle": settings.vk_ca_bundle or None,
+        "verify_ssl": settings.vk_verify_ssl,
+    }
+    wall_client = VKClient(settings.vk_wall_token, **client_options)
+    message_client = VKClient(settings.vk_message_token, **client_options)
     storage = Storage(settings.database_path)
     service = FutureBotService(settings, wall_client, message_client, storage, chat_client=message_client)
 

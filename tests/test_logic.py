@@ -9,6 +9,7 @@ from future_bot.logic import (
     parse_control_command,
     parse_query_groups,
     parse_search_command,
+    remove_known_posts,
     remove_liked_posts,
     remove_posts_linked_from_ff,
 )
@@ -231,3 +232,12 @@ def test_parse_control_commands_for_stop_search_and_shutdown():
     assert stop_search.action == "stop_search"
     assert shutdown is not None
     assert shutdown.action == "shutdown"
+
+
+def test_remove_known_posts_drops_posts_already_stored_in_database():
+    known = Post(owner_id=-30, post_id=1, source_group="eofru", date=100, text="Технология")
+    fresh = Post(owner_id=-30, post_id=2, source_group="eofru", date=200, text="Технология")
+
+    remaining = remove_known_posts([known, fresh], ["https://vk.ru/wall-30_1"])
+
+    assert [post.post_id for post in remaining] == [2]

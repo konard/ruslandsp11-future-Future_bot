@@ -35,6 +35,7 @@ class Settings:
     vk_group_token: str
     vk_user_token: str
     vk_message_token: str
+    vk_service_token: str = ""
     database_path: Path = Path("data/future_bot.sqlite3")
     ff_group: str = "world_of_futuristica"
     source_groups_file: Path = DEFAULT_SOURCE_GROUPS_FILE
@@ -42,11 +43,35 @@ class Settings:
     target_peer_id: int = 2_000_000_015
     target_chat_title: str = "Аналитика и прогнозы"
     allowed_user_ids: tuple[int, ...] = (199592366, 1849091)
+    admin_user_ids: tuple[int, ...] = ()
     command_poll_interval_seconds: float = 10.0
     post_retention_days: int = 10
     schedule_time: time = time(3, 0)
     timezone: str = "Europe/Moscow"
     vk_api_version: str = "5.199"
+    vk_ca_bundle: str = ""
+    vk_verify_ssl: bool = True
+
+    @property
+    def vk_wall_token(self) -> str:
+        """Токен для чтения стен и списков лайков.
+
+        Приоритет у сервисного токена приложения (``VK_SERVICE_TOKEN``): именно
+        им теперь работает бот. Если он не задан, используется прежний токен
+        пользователя.
+        """
+
+        return self.vk_service_token or self.vk_user_token
+
+    @property
+    def like_admin_user_ids(self) -> tuple[int, ...]:
+        """Админы, чей лайк исключает пост из отчёта.
+
+        По умолчанию совпадает со списком пользователей, которым разрешены
+        команды (``FFBOT_ALLOWED_USER_IDS``) — это админы чата.
+        """
+
+        return self.admin_user_ids or self.allowed_user_ids
 
     @classmethod
     def from_env(cls, env_file: str | Path = ".env") -> "Settings":
@@ -55,22 +80,21 @@ class Settings:
 
         group_token = env.get("VK_GROUP_TOKEN", "").strip()
         user_token = env.get("VK_USER_TOKEN", "").strip()
+        service_token = env.get("VK_SERVICE_TOKEN", "").strip()
         message_token = env.get("VK_MESSAGE_TOKEN", "").strip() or group_token
-        missing = [
-            name
-            for name, value in (
-                ("VK_GROUP_TOKEN", group_token),
-                ("VK_USER_TOKEN", user_token),
+        if not group_token:
+            raise ConfigError("Не заданы обязательные переменные окружения: VK_GROUP_TOKEN")
+        if not service_token and not user_token:
+            raise ConfigError(
+                "Нужен токен для чтения стен: задайте VK_SERVICE_TOKEN "
+                "(сервисный токен приложения) или VK_USER_TOKEN"
             )
-            if not value
-        ]
-        if missing:
-            raise ConfigError(f"Не заданы обязательные переменные окружения: {', '.join(missing)}")
 
         return cls(
             vk_group_token=group_token,
             vk_user_token=user_token,
             vk_message_token=message_token,
+            vk_service_token=service_token,
             database_path=Path(env.get("FFBOT_DATABASE_PATH", "data/future_bot.sqlite3")),
             ff_group=normalize_group_identifier(
                 env.get("FFBOT_FF_GROUP", "https://vk.ru/world_of_futuristica")
@@ -80,6 +104,7 @@ class Settings:
             target_peer_id=int(env.get("FFBOT_TARGET_PEER_ID", "2000000015")),
             target_chat_title=env.get("FFBOT_TARGET_CHAT_TITLE", "Аналитика и прогнозы"),
             allowed_user_ids=parse_int_csv(env.get("FFBOT_ALLOWED_USER_IDS", "199592366,1849091")),
+            admin_user_ids=parse_int_csv(env.get("FFBOT_ADMIN_USER_IDS", "")),
             command_poll_interval_seconds=float(env.get("FFBOT_COMMAND_POLL_INTERVAL_SECONDS", "10")),
             post_retention_days=parse_positive_int(
                 env.get("FFBOT_POST_RETENTION_DAYS", "10"), "FFBOT_POST_RETENTION_DAYS"
@@ -87,6 +112,8 @@ class Settings:
             schedule_time=parse_hhmm(env.get("FFBOT_SCHEDULE_TIME", "03:00")),
             timezone=env.get("FFBOT_TIMEZONE", "Europe/Moscow"),
             vk_api_version=env.get("VK_API_VERSION", "5.199"),
+            vk_ca_bundle=env.get("FFBOT_VK_CA_BUNDLE", "").strip(),
+            vk_verify_ssl=parse_bool(env.get("FFBOT_VK_SSL_VERIFY", "1"), "FFBOT_VK_SSL_VERIFY"),
         )
 
 
@@ -196,6 +223,15 @@ def parse_positive_int(value: str, name: str) -> int:
     if result <= 0:
         raise ConfigError(f"Значение {name} должно быть больше нуля, получено {result}.")
     return result
+
+
+def parse_bool(value: str, name: str) -> bool:
+    normalized = str(value).strip().casefold()
+    if normalized in {"1", "true", "yes", "on", "да"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "нет"}:
+        return False
+    raise ConfigError(f"Некорректное значение {name}: {value!r}. Ожидается 1/0.")
 
 
 def parse_int_csv(value: str) -> tuple[int, ...]:

@@ -9,6 +9,7 @@ from future_bot.config import (
     load_source_groups_file,
     load_terms_file,
     normalize_group_identifier,
+    parse_bool,
     parse_hhmm,
     parse_int_csv,
     parse_positive_int,
@@ -119,3 +120,49 @@ def test_settings_from_env_file(tmp_path, monkeypatch):
     assert settings.command_poll_interval_seconds == 10.0
     assert settings.schedule_time == time(3, 0)
     assert settings.timezone == "UTC"
+
+
+def test_settings_prefers_service_token_for_wall_reading(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "VK_GROUP_TOKEN=group\nVK_SERVICE_TOKEN=service\nVK_USER_TOKEN=user\n",
+        encoding="utf-8",
+    )
+    for name in ("VK_GROUP_TOKEN", "VK_SERVICE_TOKEN", "VK_USER_TOKEN", "FFBOT_ADMIN_USER_IDS"):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = Settings.from_env(env_file)
+
+    assert settings.vk_wall_token == "service"
+    assert settings.like_admin_user_ids == settings.allowed_user_ids
+
+
+def test_settings_require_service_or_user_token(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text("VK_GROUP_TOKEN=group\n", encoding="utf-8")
+    for name in ("VK_GROUP_TOKEN", "VK_SERVICE_TOKEN", "VK_USER_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises(ConfigError, match="VK_SERVICE_TOKEN"):
+        Settings.from_env(env_file)
+
+
+def test_admin_user_ids_override_allowed_users_for_like_check():
+    settings = Settings(
+        vk_group_token="group",
+        vk_user_token="",
+        vk_message_token="group",
+        vk_service_token="service",
+        allowed_user_ids=(1, 2),
+        admin_user_ids=(3,),
+    )
+
+    assert settings.like_admin_user_ids == (3,)
+
+
+def test_parse_bool_accepts_common_values_and_rejects_others():
+    assert parse_bool("1", "FFBOT_VK_SSL_VERIFY") is True
+    assert parse_bool("нет", "FFBOT_VK_SSL_VERIFY") is False
+
+    with pytest.raises(ConfigError, match="FFBOT_VK_SSL_VERIFY"):
+        parse_bool("может быть", "FFBOT_VK_SSL_VERIFY")

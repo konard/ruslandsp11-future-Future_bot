@@ -578,8 +578,13 @@ def test_chat_search_reuses_recent_source_group_scan_when_groups_unchanged(tmp_p
     source_calls = [call for call in wall_client.calls if call[0] == "eofru"]
     assert len(source_calls) == 1
     assert result is not None
-    assert result.final_posts == 1
-    assert "1. https://vk.com/wall-20_1" in message_client.edits[-1][2]
+    # Пост из кеша уже был выдан первым поиском и записан в базу новых постов,
+    # поэтому повторно он в отчёт не попадает.
+    assert result.final_posts == 0
+    assert "не найдено" in message_client.edits[-1][2]
+    assert [post.source_url for post in Storage(settings.database_path).list_new_posts()] == [
+        "https://vk.com/wall-20_1",
+    ]
 
 
 def test_chat_search_refreshes_recent_group_scan_when_group_file_changes(tmp_path):
@@ -803,10 +808,10 @@ def test_progress_message_reports_unexpected_error_before_reraising(tmp_path):
     message_client = FakeMessageClient()
     storage = Storage(settings.database_path)
 
-    def fail_replace_new_posts(posts):
+    def fail_add_new_posts(posts):
         raise RuntimeError("database write exploded")
 
-    storage.replace_new_posts = fail_replace_new_posts
+    storage.add_new_posts = fail_add_new_posts
     service = FutureBotService(settings, wall_client, message_client, storage)
 
     with pytest.raises(RuntimeError, match="database write exploded"):
@@ -1153,3 +1158,139 @@ def test_run_once_stops_before_next_source_group_when_stop_requested(tmp_path):
     assert ("second", 1782529200) not in wall_client.calls
     assert Storage(settings.database_path).list_new_posts() == []
     assert message_client.edits[-1][2] == "Поиск остановлен.\nПроверено групп: 1 из 2."
+
+
+class FakeLikesClient:
+    def __init__(self, likers_by_post=None, failing_posts=()):
+        self.likers_by_post = likers_by_post or {}
+        self.failing_posts = set(failing_posts)
+        self.calls = []
+
+    def get_post_likers(self, owner_id, post_id, count=1000):
+        self.calls.append((owner_id, post_id))
+        if (owner_id, post_id) in self.failing_posts:
+            raise RuntimeError("likes.getList недоступен")
+        return set(self.likers_by_post.get((owner_id, post_id), ()))
+
+
+def make_settings(tmp_path, groups_file, terms_file, **overrides):
+    values = dict(
+        vk_group_token="group-token",
+        vk_user_token="",
+        vk_service_token="service-token",
+        vk_message_token="group-token",
+        database_path=tmp_path / "future_bot.sqlite3",
+        ff_group="world_of_futuristica",
+        source_groups_file=groups_file,
+        terms_file=terms_file,
+        target_peer_id=2_000_000_170,
+        allowed_user_ids=(199592366,),
+        timezone="UTC",
+    )
+    values.update(overrides)
+    return Settings(**values)
+
+
+def test_run_once_excludes_posts_liked_by_chat_admins_via_likes_get_list(tmp_path):
+    groups_file, terms_file = write_runtime_lists(tmp_path, ("eofru",), ("Технология",))
+    settings = make_settings(tmp_path, groups_file, terms_file, admin_user_ids=(1849091,))
+    liked_by_admin = Post(owner_id=-30, post_id=1, source_group="eofru", date=200, text="Новая технология")
+    liked_by_stranger = Post(owner_id=-30, post_id=2, source_group="eofru", date=300, text="Свежая технология")
+    wall_client = FakeWallClient({"world_of_futuristica": [], "eofru": [liked_by_admin, liked_by_stranger]})
+    likes_client = FakeLikesClient({(-30, 1): {1849091, 777}, (-30, 2): {777}})
+    message_client = FakeMessageClient()
+
+    service = FutureBotService(
+        settings,
+        wall_client,
+        message_client,
+        Storage(settings.database_path),
+        likes_client=likes_client,
+    )
+    result = service.run_once(now=datetime(2026, 6, 28, 3, 0, tzinfo=timezone.utc))
+
+    assert result.final_posts == 1
+    assert message_client.sent == [(2_000_000_170, "1. https://vk.com/wall-30_2")]
+    assert sorted(likes_client.calls) == [(-30, 1), (-30, 2)]
+
+
+def test_run_once_keeps_post_when_likes_get_list_fails(tmp_path):
+    groups_file, terms_file = write_runtime_lists(tmp_path, ("eofru",), ("Технология",))
+    settings = make_settings(tmp_path, groups_file, terms_file, admin_user_ids=(1849091,))
+    post = Post(owner_id=-30, post_id=1, source_group="eofru", date=200, text="Новая технология")
+    wall_client = FakeWallClient({"world_of_futuristica": [], "eofru": [post]})
+    likes_client = FakeLikesClient(failing_posts=[(-30, 1)])
+    message_client = FakeMessageClient()
+
+    service = FutureBotService(
+        settings,
+        wall_client,
+        message_client,
+        Storage(settings.database_path),
+        likes_client=likes_client,
+    )
+    result = service.run_once(now=datetime(2026, 6, 28, 3, 0, tzinfo=timezone.utc))
+
+    assert result.final_posts == 1
+    assert message_client.sent == [(2_000_000_170, "1. https://vk.com/wall-30_1")]
+
+
+def test_run_once_reports_post_only_once_for_several_command_lines(tmp_path):
+    groups_file, terms_file = write_runtime_lists(
+        tmp_path,
+        ("eofru",),
+        ("Технология", "Прогноз"),
+    )
+    settings = make_settings(tmp_path, groups_file, terms_file, admin_user_ids=())
+    post = Post(
+        owner_id=-30,
+        post_id=1,
+        source_group="eofru",
+        date=200,
+        text="Технология и прогноз в одном посте",
+    )
+    wall_client = FakeWallClient({"world_of_futuristica": [], "eofru": [post]})
+    message_client = FakeMessageClient()
+
+    service = FutureBotService(settings, wall_client, message_client, Storage(settings.database_path))
+    service.run_once(now=datetime(2026, 6, 28, 3, 0, tzinfo=timezone.utc))
+
+    messages = [message for _, message in message_client.sent]
+    assert messages[0] == "1. https://vk.com/wall-30_1"
+    assert "не найдено" in messages[1]
+    assert [post.source_url for post in Storage(settings.database_path).list_new_posts()] == [
+        "https://vk.com/wall-30_1",
+    ]
+
+
+def test_run_once_skips_post_already_stored_in_new_posts_database(tmp_path):
+    groups_file, terms_file = write_runtime_lists(tmp_path, ("eofru",), ("Технология",))
+    settings = make_settings(tmp_path, groups_file, terms_file, admin_user_ids=())
+    known_post = Post(
+        owner_id=-30,
+        post_id=1,
+        source_group="eofru",
+        date=int(datetime(2026, 6, 27, 3, 0, tzinfo=timezone.utc).timestamp()),
+        text="Новая технология",
+    )
+    fresh_post = Post(
+        owner_id=-30,
+        post_id=2,
+        source_group="eofru",
+        date=int(datetime(2026, 6, 28, 1, 0, tzinfo=timezone.utc).timestamp()),
+        text="Свежая технология",
+    )
+    storage = Storage(settings.database_path)
+    storage.add_new_posts([known_post])
+    wall_client = FakeWallClient({"world_of_futuristica": [], "eofru": [known_post, fresh_post]})
+    message_client = FakeMessageClient()
+
+    service = FutureBotService(settings, wall_client, message_client, storage)
+    result = service.run_once(now=datetime(2026, 6, 28, 3, 0, tzinfo=timezone.utc))
+
+    assert result.final_posts == 1
+    assert message_client.sent == [(2_000_000_170, "1. https://vk.com/wall-30_2")]
+    assert sorted(post.source_url for post in storage.list_new_posts()) == [
+        "https://vk.com/wall-30_1",
+        "https://vk.com/wall-30_2",
+    ]

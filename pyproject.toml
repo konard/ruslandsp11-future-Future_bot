@@ -4,19 +4,26 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "future-bot"
-version = "0.4.0"
+version = "0.6.0"
 description = "Daily VK post digest bot for Formula Futurology."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
+certs = [
+    "certifi>=2024.2.2",
+]
 test = [
     "pytest>=8.0",
 ]
 
 [project.scripts]
 future-bot = "future_bot.__main__:main"
+
+[tool.setuptools]
+# Явный список пакетов: каталоги experiments/ и tests/ в дистрибутив не входят.
+packages = ["future_bot"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

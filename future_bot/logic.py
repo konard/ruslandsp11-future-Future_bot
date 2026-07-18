@@ -313,6 +313,24 @@ def remove_liked_posts(posts: Iterable[Post]) -> list[Post]:
     return [post for post in posts if not post.liked]
 
 
+def post_identity(post: Post) -> str:
+    """Ключ поста для сравнения с уже выданными постами."""
+
+    return normalize_url(post.source_url) or post.post_key
+
+
+def remove_known_posts(posts: Iterable[Post], known_urls: Iterable[str]) -> list[Post]:
+    """Убирает посты, уже записанные в базу новых постов.
+
+    Один и тот же пост может подойти сразу под несколько строк файла команд,
+    поэтому перед выдачей он сверяется с накопленной базой: повторно по другому
+    слову он в отчёт не попадает.
+    """
+
+    known = {normalized for url in known_urls if (normalized := normalize_url(url))}
+    return [post for post in posts if post_identity(post) not in known]
+
+
 def remove_posts_linked_from_ff(posts: Iterable[Post], ff_links: Iterable[str]) -> list[Post]:
     normalized_ff_links = {normalized for link in ff_links if (normalized := normalize_url(link))}
     remaining: list[Post] = []

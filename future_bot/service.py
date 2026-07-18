@@ -21,6 +21,8 @@ from future_bot.logic import (
     format_numbered_links,
     parse_control_command,
     parse_search_command,
+    post_identity,
+    remove_known_posts,
     remove_liked_posts,
     remove_posts_linked_from_ff,
 )
@@ -44,6 +46,11 @@ class MessageClient(Protocol):
 
 class ChatClient(Protocol):
     def iter_recent_messages(self, peer_id: int, count: int = 50) -> Iterable[IncomingMessage]:
+        ...
+
+
+class LikesClient(Protocol):
+    def get_post_likers(self, owner_id: int, post_id: int, count: int = 1000) -> set[int]:
         ...
 
 
@@ -85,12 +92,17 @@ class FutureBotService:
         storage: Storage,
         chat_client: ChatClient | None = None,
         clock: Callable[[], datetime] | None = None,
+        likes_client: LikesClient | None = None,
     ) -> None:
         self.settings = settings
         self.wall_client = wall_client
         self.message_client = message_client
         self.storage = storage
         self.chat_client = chat_client
+        # Списки лайков читаются тем же токеном, что и стены (сервисным).
+        if likes_client is None and hasattr(wall_client, "get_post_likers"):
+            likes_client = wall_client  # type: ignore[assignment]
+        self.likes_client = likes_client
         self._clock = clock
         self._run_lock = threading.Lock()
         self._search_stop_event = threading.Event()
@@ -290,6 +302,10 @@ class FutureBotService:
 
             unique_source_posts = dedupe_posts(source_posts)
             ff_links = self.storage.get_ff_links()
+            # Посты, уже выданные раньше (в том числе по другому слову), в отчёт
+            # не попадают повторно; набор пополняется по ходу текущего поиска.
+            known_urls = self.storage.get_new_post_urls()
+            likes_cache: dict[str, bool] = {}
 
             results: list[SyncResult] = []
             messages: list[str] = []
@@ -298,7 +314,10 @@ class FutureBotService:
                 filtered_posts = filter_posts_by_groups(unique_source_posts, query.groups)
                 final_posts = remove_posts_linked_from_ff(filtered_posts, ff_links)
                 final_posts = remove_liked_posts(final_posts)
+                final_posts = remove_known_posts(final_posts, known_urls)
+                final_posts = self._remove_posts_liked_by_admins(final_posts, likes_cache)
                 final_posts = sorted(final_posts, key=lambda post: post.date, reverse=True)
+                known_urls.update(post_identity(post) for post in final_posts)
                 all_final_posts.extend(final_posts)
 
                 links_message = format_numbered_links(
@@ -337,7 +356,7 @@ class FutureBotService:
                     )
                 )
 
-            self.storage.replace_new_posts(dedupe_posts(all_final_posts))
+            self.storage.add_new_posts(dedupe_posts(all_final_posts))
 
             for index, message in enumerate(messages):
                 _finish_message(
@@ -541,6 +560,42 @@ class FutureBotService:
             LOGGER.exception("Группа %s пропущена из-за ошибки загрузки стены", group)
             failed_groups.append(group)
             return []
+
+    def _remove_posts_liked_by_admins(
+        self,
+        posts: Sequence[Post],
+        likes_cache: dict[str, bool],
+    ) -> list[Post]:
+        """Убирает из итогового списка посты, лайкнутые админами чата.
+
+        Сервисный токен приложения не поддерживает ``likes.isLiked``, поэтому
+        для каждой оставшейся ссылки запрашивается ``likes.getList`` и лайк
+        админа (``FFBOT_ADMIN_USER_IDS``, по умолчанию — разрешённые
+        пользователи) считается отметкой «уже просмотрено». Ошибка запроса не
+        убирает пост из отчёта.
+        """
+
+        admin_ids = set(self.settings.like_admin_user_ids)
+        if self.likes_client is None or not admin_ids or not posts:
+            return list(posts)
+
+        remaining: list[Post] = []
+        for post in posts:
+            key = post_identity(post)
+            liked = likes_cache.get(key)
+            if liked is None:
+                try:
+                    likers = self.likes_client.get_post_likers(post.owner_id, post.post_id)
+                except Exception:
+                    LOGGER.exception("Не удалось получить список лайков поста %s", post.source_url)
+                    likers = set()
+                liked = bool(likers & admin_ids)
+                likes_cache[key] = liked
+            if liked:
+                LOGGER.info("Пост %s исключен: лайкнут админом", post.source_url)
+                continue
+            remaining.append(post)
+        return remaining
 
     def _handle_control_command(
         self,
